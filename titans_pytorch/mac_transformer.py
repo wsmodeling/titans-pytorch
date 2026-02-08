@@ -68,6 +68,7 @@ from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
 # proposed neural memory
 
 from titans_pytorch.neural_memory import NeuralMemory
+from titans_pytorch.kda_memory import KDAMemory, MultiheadRMSNorm
 
 # constants
 
@@ -564,25 +565,49 @@ class MemoryAsContextTransformer(Module):
             if layer in neural_memory_layers:
                 mem_hyper_conn = init_hyper_conn(add_branch_out_to_residual = not neural_mem_gate_attn_output)
 
-                if not is_first and neural_memory_qkv_receives_diff_views:
-                    num_layer_choices = (layer - 1) * 4 + 1 # for each layer, have memory input select from attn inp, attn out, ff inp, and ff out - plus one for the current point in the residual stream (memory input)
+                # Check if neural_memory_model is already a complete memory module (like KDAMemory)
+                # vs a model that needs to be wrapped in NeuralMemory
+                is_kda_memory = isinstance(neural_memory_model, KDAMemory)
 
-                    mem_qkv_layer_selector = nn.Sequential(
-                        nn.RMSNorm(dim),
-                        nn.Linear(dim, 3 * num_layer_choices),
-                        Rearrange('... (views layers) -> views ... layers', views = 3),
-                        nn.Softmax(dim = -1)
+                if is_kda_memory:
+                    # KDAMemory is already a complete module, but we need to recreate it
+                    # with the correct dim (transformer dim, not memory model dim)
+                    # Extract configuration from template
+                    template = neural_memory_model
+                    mem = KDAMemory(
+                        dim=dim,  # Use transformer dim
+                        dim_head=template.heads and (dim // template.heads) or dim,
+                        heads=template.heads,
+                        chunk_size=template.chunk_size,
+                        use_chunk=template.use_chunk,
+                        pre_rmsnorm=isinstance(template.retrieve_norm, nn.RMSNorm),
+                        post_rmsnorm=isinstance(template.multihead_rmsnorm, MultiheadRMSNorm),
+                        qk_rmsnorm=isinstance(template.q_norm, MultiheadRMSNorm),
                     )
+                    # Note: KDAMemory doesn't support qkv_receives_diff_views yet
+                    # So we skip the layer selector
+                    mem_qkv_layer_selector = None
+                else:
+                    # Traditional NeuralMemory path
+                    if not is_first and neural_memory_qkv_receives_diff_views:
+                        num_layer_choices = (layer - 1) * 4 + 1 # for each layer, have memory input select from attn inp, attn out, ff inp, and ff out - plus one for the current point in the residual stream (memory input)
 
-                mem = NeuralMemory(
-                    dim = dim,
-                    chunk_size = self.neural_memory_segment_len,
-                    batch_size = neural_memory_batch_size,
-                    model = deepcopy(neural_memory_model),
-                    qkv_receives_diff_views = True,
-                    accept_weight_residual = neural_mem_weight_residual and not is_first_neural_mem,
-                    **neural_memory_kwargs
-                )
+                        mem_qkv_layer_selector = nn.Sequential(
+                            nn.RMSNorm(dim),
+                            nn.Linear(dim, 3 * num_layer_choices),
+                            Rearrange('... (views layers) -> views ... layers', views = 3),
+                            nn.Softmax(dim = -1)
+                        )
+
+                    mem = NeuralMemory(
+                        dim = dim,
+                        chunk_size = self.neural_memory_segment_len,
+                        batch_size = neural_memory_batch_size,
+                        model = deepcopy(neural_memory_model),
+                        qkv_receives_diff_views = True,
+                        accept_weight_residual = neural_mem_weight_residual and not is_first_neural_mem,
+                        **neural_memory_kwargs
+                    )
 
                 is_first_neural_mem = False
 
@@ -801,24 +826,38 @@ class MemoryAsContextTransformer(Module):
 
                 mem_input, add_residual = mem_hyper_conn(x)
 
-                if not exists(mem_qkv_layer_selector):
-                    qkv_mem_input = stack((mem_input, mem_input, mem_input))
+                # Check if this is KDAMemory (different interface)
+                is_kda = isinstance(mem, KDAMemory)
+
+                if is_kda:
+                    # KDAMemory interface: forward(seq, state, return_state)
+                    # It doesn't support qkv_receives_diff_views, so we just use mem_input
+                    retrieved, next_neural_mem_cache = mem.forward(
+                        mem_input,
+                        state = next(neural_mem_caches, None),
+                        return_state = True
+                    )
                 else:
-                    layers_to_choose_from = stack((mem_input, *mem_input_layers))
+                    # NeuralMemory interface
+                    if not exists(mem_qkv_layer_selector):
+                        qkv_mem_input = stack((mem_input, mem_input, mem_input))
+                    else:
+                        layers_to_choose_from = stack((mem_input, *mem_input_layers))
 
-                    # let the current `mem_input` select the 3 layers for qkv
+                        # let the current `mem_input` select the 3 layers for qkv
 
-                    selected = mem_qkv_layer_selector(mem_input)
+                        selected = mem_qkv_layer_selector(mem_input)
 
-                    qkv_mem_input = einsum(layers_to_choose_from, selected, 'l b n d, v b n l -> v b n d')
+                        qkv_mem_input = einsum(layers_to_choose_from, selected, 'l b n d, v b n l -> v b n d')
 
-                retrieved, next_neural_mem_cache = mem.forward(
-                    qkv_mem_input,
-                    state = next(neural_mem_caches, None),
-                    prev_weights = mem_weight_residual
-                )
+                    retrieved, next_neural_mem_cache = mem.forward(
+                        qkv_mem_input,
+                        state = next(neural_mem_caches, None),
+                        prev_weights = mem_weight_residual
+                    )
 
-                if self.neural_mem_weight_residual:
+                # Only update weight residual for NeuralMemory (not KDA)
+                if self.neural_mem_weight_residual and not is_kda:
                     mem_weight_residual = next_neural_mem_cache.updates
 
                 if self.gate_attn_output:

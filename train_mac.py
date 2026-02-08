@@ -42,6 +42,9 @@ SEQ_LEN = 512
 
 # neural memory related
 
+# Choose memory type: 'neural' (TTT-based) or 'kda' (linear attention)
+MEMORY_TYPE = 'kda'  # Options: 'neural', 'kda'
+
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
 NUM_LONGTERM_MEM = 4
@@ -62,15 +65,19 @@ NEURAL_MEM_WEIGHT_RESIDUAL = True               # learning to accept contributio
 NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW = True        # will allow the neural memory to select what layers from which to derive queries / keys / values, effectively allowing it to graft itself to the transformer in any way to be beneficial. this is to address an issue from a phd student who noted that the mem network is learning nothing more than wk @ wv. this also generalizes all possible ways to connect the neural memory to a transformer, a sort of NAS
 NEURAL_MEM_SPEC_NORM_SURPRISES = True           # applying lessons from Muon optimizer to surprise updates, by spectral norming the surprises
 
+# KDA memory specific settings (only used when MEMORY_TYPE = 'kda')
+KDA_CHUNK_SIZE = NEURAL_MEM_SEGMENT_LEN * 8     # Chunk size for KDA (larger chunks = more efficient)
+KDA_USE_CHUNK = True                            # Use chunked KDA (faster) vs recurrent (more flexible)
+
 # experiment related
 
 PROJECT_NAME = 'titans-mac-transformer'
-RUN_NAME = f'mac - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
+RUN_NAME = f'mac-{MEMORY_TYPE} - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
 WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 
 # perf related
 
-USE_ACCELERATED_SCAN = True
+USE_ACCELERATED_SCAN = False
 USE_FLEX_ATTN = True
 USE_FAST_INFERENCE = False
 
@@ -96,11 +103,30 @@ def decode_tokens(tokens):
 
 # memory model
 
-if USE_MEM_ATTENTION_MODEL:
+if MEMORY_TYPE == 'kda':
+    from titans_pytorch import create_kda_memory_for_mac
+
+    print(f"Using KDA Memory (Linear Attention)")
+    print(f"  - Chunk size: {KDA_CHUNK_SIZE}")
+    print(f"  - Use chunk mode: {KDA_USE_CHUNK}")
+    print(f"  - QK RMSNorm: {NEURAL_MEM_QK_NORM}")
+
+    # KDAMemory is used directly, not wrapped in NeuralMemory
+    # So we create it differently - MAC Transformer will use it as-is
+    neural_memory_model = create_kda_memory_for_mac(
+        dim = 64,
+        chunk_size = KDA_CHUNK_SIZE,
+        use_chunk = KDA_USE_CHUNK,
+        qk_rmsnorm = NEURAL_MEM_QK_NORM,
+    )
+elif USE_MEM_ATTENTION_MODEL:
+    print("Using Memory Attention Model")
     neural_memory_model = MemoryAttention(
         dim = 64
     )
 else:
+    print(f"Using Neural Memory (TTT-based MLP)")
+    print(f"  - Depth: {NEURAL_MEMORY_DEPTH}")
     neural_memory_model = MemoryMLP(
         dim = 64,
         depth = NEURAL_MEMORY_DEPTH
@@ -193,7 +219,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
         model.eval()
         inp = random.choice(val_dataset)[:PRIME_LENGTH]
         prime = decode_tokens(inp)
-        print(f'%s \n\n %s', (prime, '*' * 100))
+        print(f'{prime} \n\n {"*" * 100}')
 
         sample = model.sample(inp[None, ...], GENERATE_LENGTH, use_cache = USE_FAST_INFERENCE)
         output_str = decode_tokens(sample[0])

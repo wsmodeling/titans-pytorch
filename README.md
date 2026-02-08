@@ -10,6 +10,29 @@ Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytor
 
 [Quick Colab Run](https://colab.research.google.com/drive/11cGgSABykte3qbK-hjzPgLif3-9UUejm?usp=sharing)
 
+---
+
+### 📚 Extended Documentation
+
+This repository now includes **KDA (Kimi Dynamic Attention)** as an alternative memory mechanism, with comprehensive documentation:
+
+- **[📖 Documentation Index](DOCUMENTATION_INDEX.md)** - Quick navigation to all docs
+- **[💬 Complete Conversation Log](CONVERSATION_SUMMARY.md)** - Detailed technical discussions and implementation details
+- **[⚡ Memory Switching Guide](MEMORY_SWITCHING_GUIDE.md)** - How to switch between Neural Memory and KDA Memory
+- **[🔬 KDA Memory README](KDAMEMORY_README.md)** - KDA-specific documentation
+
+**Quick Start with KDA Memory**:
+```python
+from titans_pytorch import create_kda_memory_for_mac
+
+# Switch between memory types in train_mac.py
+MEMORY_TYPE = 'kda'  # or 'neural' for original TTT-based memory
+```
+
+See [MEMORY_SWITCHING_GUIDE.md](MEMORY_SWITCHING_GUIDE.md) for details.
+
+---
+
 ## Appreciation
 
 - [Eryk](https://github.com/sentialx) for sharing his early experimental results with me, positive for 2 layer MLP

@@ -4,6 +4,14 @@ from titans_pytorch.neural_memory import (
     mem_state_detach
 )
 
+from titans_pytorch.kda_memory import (
+    KDAMemory,
+    KDAState,
+    naive_recurrent_kda,
+    naive_chunk_kda,
+    create_kda_memory_for_mac
+)
+
 from titans_pytorch.memory_models import (
     MemoryMLP,
     MemoryAttention,
