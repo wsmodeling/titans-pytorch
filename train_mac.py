@@ -168,7 +168,7 @@ val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE))
 
 optim = AdoptAtan2(model.parameters(), lr = LEARNING_RATE)
 
-# training
+# training here
 
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
     model.train()
