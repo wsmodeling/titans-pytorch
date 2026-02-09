@@ -572,17 +572,14 @@ class MemoryAsContextTransformer(Module):
                 if is_kda_memory:
                     # KDAMemory is already a complete module, but we need to recreate it
                     # with the correct dim (transformer dim, not memory model dim)
-                    # Extract configuration from template
                     template = neural_memory_model
                     mem = KDAMemory(
                         dim=dim,  # Use transformer dim
-                        dim_head=template.heads and (dim // template.heads) or dim,
                         heads=template.heads,
                         chunk_size=template.chunk_size,
                         use_chunk=template.use_chunk,
-                        pre_rmsnorm=isinstance(template.retrieve_norm, nn.RMSNorm),
-                        post_rmsnorm=isinstance(template.multihead_rmsnorm, MultiheadRMSNorm),
-                        qk_rmsnorm=isinstance(template.q_norm, MultiheadRMSNorm),
+                        use_short_conv=template.use_short_conv,
+                        allow_neg_eigval=template.allow_neg_eigval,
                     )
                     # Note: KDAMemory doesn't support qkv_receives_diff_views yet
                     # So we skip the layer selector

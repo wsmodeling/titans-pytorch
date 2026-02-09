@@ -43,7 +43,7 @@ SEQ_LEN = 512
 # neural memory related
 
 # Choose memory type: 'neural' (TTT-based) or 'kda' (linear attention)
-MEMORY_TYPE = 'kda'  # Options: 'neural', 'kda'
+MEMORY_TYPE = 'neural'  # Options: 'neural', 'kda'
 
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
@@ -106,18 +106,16 @@ def decode_tokens(tokens):
 if MEMORY_TYPE == 'kda':
     from titans_pytorch import create_kda_memory_for_mac
 
-    print(f"Using KDA Memory (Linear Attention)")
+    print(f"Using KDA Memory (Kimi Delta Attention)")
     print(f"  - Chunk size: {KDA_CHUNK_SIZE}")
     print(f"  - Use chunk mode: {KDA_USE_CHUNK}")
-    print(f"  - QK RMSNorm: {NEURAL_MEM_QK_NORM}")
 
     # KDAMemory is used directly, not wrapped in NeuralMemory
-    # So we create it differently - MAC Transformer will use it as-is
+    # dim=64 is a template; MAC Transformer recreates with transformer dim
     neural_memory_model = create_kda_memory_for_mac(
         dim = 64,
         chunk_size = KDA_CHUNK_SIZE,
         use_chunk = KDA_USE_CHUNK,
-        qk_rmsnorm = NEURAL_MEM_QK_NORM,
     )
 elif USE_MEM_ATTENTION_MODEL:
     print("Using Memory Attention Model")
