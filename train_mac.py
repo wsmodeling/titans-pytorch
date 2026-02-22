@@ -32,7 +32,7 @@ from titans_pytorch import (
 # constants
 
 NUM_BATCHES = int(1e5)
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
@@ -44,8 +44,8 @@ SEQ_LEN = 512
 
 # neural memory related
 
-# Choose memory type: 'neural' (TTT-based) or 'kda' (linear attention)
-MEMORY_TYPE = 'neural'  # Options: 'neural', 'kda'
+# Choose memory type: 'neural' (TTT-based), 'kda' (linear attention), 'sparse_kda' (SM-KDA)
+MEMORY_TYPE = 'sparse_kda'  # Options: 'neural', 'kda', 'sparse_kda'
 
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
@@ -71,10 +71,15 @@ NEURAL_MEM_SPEC_NORM_SURPRISES = True           # applying lessons from Muon opt
 KDA_CHUNK_SIZE = NEURAL_MEM_SEGMENT_LEN * 8     # Chunk size for KDA (larger chunks = more efficient)
 KDA_USE_CHUNK = True                            # Use chunked KDA (faster) vs recurrent (more flexible)
 
+# Sparse KDA settings (only used when MEMORY_TYPE = 'sparse_kda')
+SPARSE_KDA_NUM_SLOTS = 8                        # N: total number of memory matrices
+SPARSE_KDA_TOP_K = 1                            # k: how many slots each token activates
+
 # experiment related
 
 PROJECT_NAME = 'titans-mac-transformer'
-RUN_NAME = f'mac-{MEMORY_TYPE} - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
+_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K}' if MEMORY_TYPE == 'sparse_kda' else ''
+RUN_NAME = f'mac-{MEMORY_TYPE}{_sparse_kda_suffix} - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
 WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 
 # perf related
@@ -122,12 +127,22 @@ if MEMORY_TYPE == 'kda':
     print(f"  - Chunk size: {KDA_CHUNK_SIZE}")
     print(f"  - Use chunk mode: {KDA_USE_CHUNK}")
 
-    # KDAMemory is used directly, not wrapped in NeuralMemory
-    # dim=64 is a template; MAC Transformer recreates with transformer dim
     neural_memory_model = create_kda_memory_for_mac(
         dim = 64,
         chunk_size = KDA_CHUNK_SIZE,
         use_chunk = KDA_USE_CHUNK,
+    )
+elif MEMORY_TYPE == 'sparse_kda':
+    from titans_pytorch.kda_memory import create_sparse_kda_memory_for_mac
+
+    print(f"Using Sparse KDA Memory (SM-KDA)")
+    print(f"  - Num memory slots (N): {SPARSE_KDA_NUM_SLOTS}")
+    print(f"  - Top-k per token: {SPARSE_KDA_TOP_K}")
+
+    neural_memory_model = create_sparse_kda_memory_for_mac(
+        dim = 64,
+        num_memory_slots = SPARSE_KDA_NUM_SLOTS,
+        top_k = SPARSE_KDA_TOP_K,
     )
 elif USE_MEM_ATTENTION_MODEL:
     print("Using Memory Attention Model")
@@ -267,7 +282,7 @@ with profiler_context as prof:
             loss = model(next(train_loader).cuda(non_blocking = True), return_loss = True)
             loss.backward()
 
-        print(f'training loss: {loss.item():.4f}')
+        tqdm.tqdm.write(f'training loss: {loss.item():.4f}')
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optim.step()
         optim.zero_grad()
@@ -277,7 +292,7 @@ with profiler_context as prof:
             model.eval()
             with torch.no_grad():
                 loss = model(next(val_loader).cuda(non_blocking = True), return_loss = True)
-                print(f'validation loss: {loss.item():.4f}')
+                tqdm.tqdm.write(f'validation loss: {loss.item():.4f}')
 
         if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
             model.eval()

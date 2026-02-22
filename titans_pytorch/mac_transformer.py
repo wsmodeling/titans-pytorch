@@ -68,7 +68,7 @@ from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
 # proposed neural memory
 
 from titans_pytorch.neural_memory import NeuralMemory
-from titans_pytorch.kda_memory import KDAMemory, MultiheadRMSNorm
+from titans_pytorch.kda_memory import KDAMemory, SparseKDAMemory, MultiheadRMSNorm
 
 # constants
 
@@ -568,8 +568,20 @@ class MemoryAsContextTransformer(Module):
                 # Check if neural_memory_model is already a complete memory module (like KDAMemory)
                 # vs a model that needs to be wrapped in NeuralMemory
                 is_kda_memory = isinstance(neural_memory_model, KDAMemory)
+                is_sparse_kda_memory = isinstance(neural_memory_model, SparseKDAMemory)
 
-                if is_kda_memory:
+                if is_sparse_kda_memory:
+                    template = neural_memory_model
+                    mem = SparseKDAMemory(
+                        dim=dim,
+                        heads=template.heads,
+                        num_memory_slots=template.num_memory_slots,
+                        top_k=template.top_k,
+                        use_short_conv=template.use_short_conv,
+                        allow_neg_eigval=template.allow_neg_eigval,
+                    )
+                    mem_qkv_layer_selector = None
+                elif is_kda_memory:
                     # KDAMemory is already a complete module, but we need to recreate it
                     # with the correct dim (transformer dim, not memory model dim)
                     template = neural_memory_model
@@ -823,12 +835,10 @@ class MemoryAsContextTransformer(Module):
 
                 mem_input, add_residual = mem_hyper_conn(x)
 
-                # Check if this is KDAMemory (different interface)
-                is_kda = isinstance(mem, KDAMemory)
+                # Check if this is KDAMemory or SparseKDAMemory (same interface, different from NeuralMemory)
+                is_kda = isinstance(mem, (KDAMemory, SparseKDAMemory))
 
                 if is_kda:
-                    # KDAMemory interface: forward(seq, state, return_state)
-                    # It doesn't support qkv_receives_diff_views, so we just use mem_input
                     retrieved, next_neural_mem_cache = mem.forward(
                         mem_input,
                         state = next(neural_mem_caches, None),

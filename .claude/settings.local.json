@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(pip show:*)",
+      "Bash(gh pr view:*)",
+      "Bash(git fetch:*)",
+      "Bash(timeout 120 uv run:*)",
+      "Bash(awk:*)",
+      "Bash(pkill:*)",
+      "Bash(python3:*)",
+      "Bash(nvidia-smi:*)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}
