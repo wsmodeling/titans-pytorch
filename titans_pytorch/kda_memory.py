@@ -519,45 +519,56 @@ def naive_recurrent_sparse_kda(
 # ---------------------------------------------------------------------------
 
 @torch.compiler.disable
-def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S_in):
-    """Process one chunk of the sparse KDA recurrence (for gradient checkpointing)."""
+def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S_in, topk_indices):
+    """
+    Process one chunk of the sparse KDA recurrence (for gradient checkpointing).
+
+    Optimization: only gather and compute read/write for the top-k selected slots
+    per token (MoE-style), then scatter updates back to the full state S.
+    Decay still applies to all N slots since unselected slots must not freeze.
+    """
     dtype = v_chunk.dtype
     T_c = q_chunk.shape[1]
     B, _, H, K = q_chunk.shape
     V = v_chunk.shape[-1]
-    N = r_chunk.shape[-1]
 
     q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk = map(
         lambda x: x.to(torch.float), [q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk]
     )
+    topk_indices = topk_indices.long()  # [B, T_c, k]
 
     S = S_in.to(torch.float)
     o_chunk = torch.zeros(B, T_c, H, V, dtype=torch.float, device=q_chunk.device)
 
     for i in range(T_c):
-        q_i = q_chunk[:, i]   # [B, H, K]
-        k_i = k_chunk[:, i]
-        v_i = v_chunk[:, i]
-        g_i = g_chunk[:, i]
-        b_i = beta_chunk[:, i]
-        r_i = r_chunk[:, i]   # [B, N]
+        q_i = q_chunk[:, i]        # [B, H, K]
+        k_i = k_chunk[:, i]        # [B, H, K]
+        v_i = v_chunk[:, i]        # [B, H, V]
+        g_i = g_chunk[:, i]        # [B, H, K]
+        b_i = beta_chunk[:, i]     # [B, H]
+        r_i = r_chunk[:, i]        # [B, N]
+        topk_idx_i = topk_indices[:, i]  # [B, k]
 
-        # Read: retrieve from ALL N slots, then weighted-sum using sparse r_i.
-        # NOTE: sparsity is in the weights only — we still compute retrieval for every
-        # slot. Slots with r_i=0 contribute nothing to the output, but their einsum
-        # is still executed. Future optimization: skip non-selected slots entirely.
-        retrieved = torch.einsum('b h k, b n h k v -> b n h v', q_i, S)
-        o_chunk[:, i] = torch.einsum('b n, b n h v -> b h v', r_i, retrieved)
-
-        # Write: decay all N slots, compute delta for ALL N slots, then scale each
-        # slot's update by r_i[n]. Slots with r_i[n]=0 get zero delta (no update),
-        # but their kS and delta are still fully computed — same inefficiency as read.
-        # Future optimization: only compute delta for the top-k selected slots.
+        # Decay: ALL N slots decay (unselected slots must not freeze in time)
         S = S * g_i[:, None, :, :, None].exp()
-        kS = torch.einsum('b h k, b n h k v -> b n h v', k_i, S)
-        residual = v_i[:, None, :, :] - kS
-        delta = torch.einsum('b h, b n h v, b h k -> b n h k v', b_i, residual, k_i)
-        S = S + r_i[:, :, None, None, None] * delta
+
+        # Gather only top-k slots for read and write: O(k) instead of O(N)
+        # idx: [B, k, H, K, V] — expanded indices for gather/scatter
+        idx = topk_idx_i[:, :, None, None, None].expand(-1, -1, H, K, V)
+        S_topk = S.gather(1, idx)  # [B, k, H, K, V]
+
+        # Read: query against only top-k slots
+        # Note: 's' = top-k slot index, 'd' = key/head dim (avoid collision with 'k')
+        retrieved = torch.einsum('b h d, b s h d v -> b s h v', q_i, S_topk)  # [B, k, H, V]
+        r_i_topk = r_i.gather(1, topk_idx_i)                                   # [B, k]
+        o_chunk[:, i] = torch.einsum('b s, b s h v -> b h v', r_i_topk, retrieved)
+
+        # Write: delta only for top-k slots, then scatter back
+        kS = torch.einsum('b h d, b s h d v -> b s h v', k_i, S_topk)         # [B, k, H, V]
+        residual = v_i[:, None, :, :] - kS                                      # [B, k, H, V]
+        delta = torch.einsum('b h, b s h v, b h d -> b s h d v', b_i, residual, k_i)  # [B, k, H, K, V]
+        weighted_delta = r_i_topk[:, :, None, None, None] * delta              # [B, k, H, K, V]
+        S.scatter_add_(1, idx, weighted_delta)
 
     return o_chunk.to(dtype), S.to(dtype)
 
@@ -570,6 +581,7 @@ def naive_recurrent_sparse_kda_checkpointed(
     g: torch.Tensor,
     beta: torch.Tensor,
     router_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
@@ -580,6 +592,7 @@ def naive_recurrent_sparse_kda_checkpointed(
 
     Processes the sequence in chunks of `chunk_size` tokens, applying
     gradient checkpointing at each chunk boundary to reduce peak memory.
+    Only the top-k selected slots per token are read/written (MoE-style).
     """
     dtype = v.dtype
     B, T, H, K, V_dim = *q.shape, v.shape[-1]
@@ -611,17 +624,18 @@ def naive_recurrent_sparse_kda_checkpointed(
         g_c = g[:, t_start:t_end]
         b_c = beta[:, t_start:t_end]
         r_c = router_weights[:, t_start:t_end]
+        topk_c = topk_indices[:, t_start:t_end]   # [B, chunk_size, k]
 
         # grad_checkpoint passes all args through and saves/restores them
         # It only recomputes the forward during backward, not storing inner activations
         if torch.is_grad_enabled():
             o_c, S = grad_checkpoint(
                 _sparse_kda_chunk,
-                q_c, k_c, v_c, g_c, b_c, r_c, S,
+                q_c, k_c, v_c, g_c, b_c, r_c, S, topk_c,
                 use_reentrant=False,
             )
         else:
-            o_c, S = _sparse_kda_chunk(q_c, k_c, v_c, g_c, b_c, r_c, S)
+            o_c, S = _sparse_kda_chunk(q_c, k_c, v_c, g_c, b_c, r_c, S, topk_c)
 
         o_parts.append(o_c)
 
@@ -721,6 +735,7 @@ class SparseKDAMemory(Module):
             x: [B, T, dim]
         Returns:
             router_weights: [B, T, N]  — sparse, sums to 1 over selected k slots
+            topk_idx: [B, T, k]  — indices of the k selected slots per token
         """
         logits = self.router(x)                          # [B, T, N]
         # top-k mask
@@ -729,7 +744,7 @@ class SparseKDAMemory(Module):
         mask = torch.full_like(logits, float('-inf'))
         mask.scatter_(-1, topk_idx, topk_vals)
         weights = mask.softmax(dim=-1)                   # [B, T, N], k non-zero per token
-        return weights
+        return weights, topk_idx
 
     def forward(
         self,
@@ -769,14 +784,15 @@ class SparseKDAMemory(Module):
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
 
-        # Sparse routing weights [B, T, N]
+        # Sparse routing weights [B, T, N] and top-k indices [B, T, k]
         # TODO: currently read and write sparse memory are using the same slots
         # "Currently, I'm using a shared router for both reading and writing to ensure semantic consistency within each memory slot—essentially treating each slot as a specialized 'expert' for certain types of information. However, we could explore decoupled routers as a future extension to allow the model to retrieve context from one domain while storing updates in another, potentially enhancing its cross-domain reasoning."
-        router_weights = self._route(normed)
+        router_weights, topk_indices = self._route(normed)
 
         o, new_hidden_state = naive_recurrent_sparse_kda_checkpointed(
             q=q, k=k, v=v, g=g, beta=beta,
             router_weights=router_weights,
+            topk_indices=topk_indices,
             initial_state=hidden_state,
             output_final_state=return_state,
             chunk_size=32,

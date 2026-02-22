@@ -32,8 +32,8 @@ from titans_pytorch import (
 # constants
 
 NUM_BATCHES = int(1e5)
-BATCH_SIZE = 64
-GRADIENT_ACCUMULATE_EVERY = 4
+BATCH_SIZE = 128
+GRADIENT_ACCUMULATE_EVERY = 2
 LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
@@ -73,7 +73,7 @@ KDA_USE_CHUNK = True                            # Use chunked KDA (faster) vs re
 
 # Sparse KDA settings (only used when MEMORY_TYPE = 'sparse_kda')
 SPARSE_KDA_NUM_SLOTS = 8                        # N: total number of memory matrices
-SPARSE_KDA_TOP_K = 1                            # k: how many slots each token activates
+SPARSE_KDA_TOP_K = 2                            # k: how many slots each token activates
 
 # experiment related
 

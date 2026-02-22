@@ -10,7 +10,17 @@
       "Bash(awk:*)",
       "Bash(pkill:*)",
       "Bash(python3:*)",
-      "Bash(nvidia-smi:*)"
+      "Bash(nvidia-smi:*)",
+      "Bash(timeout 120 python:*)",
+      "Bash(timeout 60 python:*)",
+      "Bash(timeout 180 python:*)",
+      "Bash(kill:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(apt-get install:*)",
+      "Bash(apt-cache search:*)",
+      "Bash(conda install:*)",
+      "WebFetch(domain:arxiv.org)"
     ],
     "additionalDirectories": [
       "/tmp"
