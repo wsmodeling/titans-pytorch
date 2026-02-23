@@ -1,0 +1,40 @@
+{
+  "os":  "Linux-6.8.0-84-generic-x86_64-with-glibc2.35",
+  "python":  "CPython 3.11.10",
+  "startedAt":  "2026-02-22T23:01:08.889358Z",
+  "program":  "/workspace/wshao/titans-pytorch/train_mac.py",
+  "codePath":  "train_mac.py",
+  "codePathLocal":  "train_mac.py",
+  "git":  {
+    "remote":  "https://github.com/wsmodeling/titans-pytorch.git",
+    "commit":  "d9f66a7d2dd5d9ed6461b0885a12be436d49340e"
+  },
+  "email":  "shaowei0919@gmail.com",
+  "root":  "/workspace/wshao/titans-pytorch",
+  "host":  "043f1a6f933d",
+  "executable":  "/root/.cache/uv/environments-v2/train-mac-c8f2eaff8d15c321/bin/python3",
+  "cpu_count":  64,
+  "cpu_count_logical":  128,
+  "gpu":  "NVIDIA A100-SXM4-80GB",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "21474836480",
+      "used":  "20598788096"
+    }
+  },
+  "memory":  {
+    "total":  "1081996943360"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA A100-SXM4-80GB",
+      "memoryTotal":  "85899345920",
+      "cudaCores":  6912,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-e14795ba-0d25-9186-3b60-fa80fd472862"
+    }
+  ],
+  "cudaVersion":  "12.8",
+  "writerId":  "hfencuh3xcsi4rry8rxsncoim6emh0pe"
+}

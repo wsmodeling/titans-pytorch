@@ -45,8 +45,8 @@ SEQ_LEN = 512
 # neural memory related
 
 # Choose memory type: 'neural' (TTT-based), 'kda' (linear attention), 'sparse_kda' (SM-KDA)
-MEMORY_TYPE = 'sparse_kda'  # Options: 'neural', 'kda', 'sparse_kda'
-
+MEMORY_TYPE = 'kda'  # Options: 'neural', 'kda', 'sparse_kda'
+ 
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
 NUM_LONGTERM_MEM = 4
@@ -73,14 +73,14 @@ KDA_USE_CHUNK = True                            # Use chunked KDA (faster) vs re
 
 # Sparse KDA settings (only used when MEMORY_TYPE = 'sparse_kda')
 SPARSE_KDA_NUM_SLOTS = 8                        # N: total number of memory matrices
-SPARSE_KDA_TOP_K = 2                            # k: how many slots each token activates
+SPARSE_KDA_TOP_K = 8                            # k: how many slots each token activates
 
 # experiment related
 
 PROJECT_NAME = 'titans-mac-transformer'
 _sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K}' if MEMORY_TYPE == 'sparse_kda' else ''
 RUN_NAME = f'mac-{MEMORY_TYPE}{_sparse_kda_suffix} - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
-WANDB_ONLINE = False # turn this on to pipe experiment to cloud
+WANDB_ONLINE = True # turn this on to pipe experiment to cloud
 
 # perf related
 
@@ -101,9 +101,7 @@ PROFILE_REPEAT = 1                                 # number of profiling cycles 
 # wandb experiment tracker
 
 import wandb
-wandb.init(project = PROJECT_NAME, mode = 'disabled' if not WANDB_ONLINE else 'online')
-wandb.run.name = RUN_NAME
-wandb.run.save()
+wandb.init(project = PROJECT_NAME, name = RUN_NAME, mode = 'disabled' if not WANDB_ONLINE else 'online')
 
 # helpers
 
@@ -286,13 +284,14 @@ with profiler_context as prof:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optim.step()
         optim.zero_grad()
-        wandb.log(dict(loss = loss.item()))
+        wandb.log(dict(train_loss = loss.item()), step = i)
 
         if i % VALIDATE_EVERY == 0:
             model.eval()
             with torch.no_grad():
-                loss = model(next(val_loader).cuda(non_blocking = True), return_loss = True)
-                tqdm.tqdm.write(f'validation loss: {loss.item():.4f}')
+                val_loss = model(next(val_loader).cuda(non_blocking = True), return_loss = True)
+                tqdm.tqdm.write(f'validation loss: {val_loss.item():.4f}')
+                wandb.log(dict(val_loss = val_loss.item()), step = i)
 
         if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
             model.eval()

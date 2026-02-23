@@ -1,0 +1,51 @@
+_wandb:
+    value:
+        cli_version: 0.25.0
+        e:
+            1zuwkrq5blmlu4aa2nesw8cdpdiexhev:
+                codePath: train_mac.py
+                codePathLocal: train_mac.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "21474836480"
+                        used: "20598652928"
+                email: shaowei0919@gmail.com
+                executable: /root/.cache/uv/environments-v2/train-mac-c8f2eaff8d15c321/bin/python3
+                git:
+                    commit: d9f66a7d2dd5d9ed6461b0885a12be436d49340e
+                    remote: https://github.com/wsmodeling/titans-pytorch.git
+                gpu: NVIDIA A100-SXM4-80GB
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100-SXM4-80GB
+                      uuid: GPU-e14795ba-0d25-9186-3b60-fa80fd472862
+                host: 043f1a6f933d
+                memory:
+                    total: "1081996943360"
+                os: Linux-6.8.0-84-generic-x86_64-with-glibc2.35
+                program: /workspace/wshao/titans-pytorch/train_mac.py
+                python: CPython 3.11.10
+                root: /workspace/wshao/titans-pytorch
+                startedAt: "2026-02-23T03:42:33.384883Z"
+                writerId: 1zuwkrq5blmlu4aa2nesw8cdpdiexhev
+        m: []
+        python_version: 3.11.10
+        t:
+            "1":
+                - 1
+                - 105
+            "2":
+                - 1
+                - 105
+            "3":
+                - 13
+            "4": 3.11.10
+            "5": 0.25.0
+            "12": 0.25.0
+            "13": linux-x86_64
