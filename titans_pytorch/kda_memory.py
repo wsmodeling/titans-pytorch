@@ -203,6 +203,96 @@ def naive_chunk_kda(
 
 
 # ---------------------------------------------------------------------------
+# Chunked recurrent KDA with gradient checkpointing
+# ---------------------------------------------------------------------------
+
+@torch.compiler.disable
+def _kda_recurrent_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, S_in):
+    """Process one chunk of the KDA recurrence (for gradient checkpointing)."""
+    dtype = v_chunk.dtype
+    B, T_c, H, K = q_chunk.shape
+    V = v_chunk.shape[-1]
+
+    q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk = map(
+        lambda x: x.to(torch.float), [q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk]
+    )
+    S = S_in.to(torch.float)
+    o_chunk = torch.zeros(B, T_c, H, V, dtype=torch.float, device=q_chunk.device)
+
+    for i in range(T_c):
+        q_i, k_i, v_i, g_i, b_i = q_chunk[:, i], k_chunk[:, i], v_chunk[:, i], g_chunk[:, i], beta_chunk[:, i]
+        S = S * g_i[..., None].exp()
+        S = S + torch.einsum('b h k, b h v -> b h k v', b_i[..., None] * k_i, v_i - (k_i[..., None] * S).sum(-2))
+        o_chunk[:, i] = torch.einsum('b h k, b h k v -> b h v', q_i, S)
+
+    return o_chunk.to(dtype), S.to(dtype)
+
+
+@torch.compiler.disable
+def kda_recurrent_checkpointed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 32,
+):
+    """
+    Chunked KDA recurrence with gradient checkpointing for memory efficiency.
+
+    Processes the sequence in chunks of `chunk_size` tokens, applying
+    gradient checkpointing at each chunk boundary to avoid storing all
+    intermediate activations for the backward pass.
+    """
+    dtype = v.dtype
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+
+    if scale is None:
+        scale = K ** -0.5
+
+    q = q * scale
+
+    if initial_state is not None:
+        S = initial_state.float()
+    else:
+        S = q.new_zeros(B, H, K, V)
+
+    num_chunks = (T + chunk_size - 1) // chunk_size
+    o_parts = []
+
+    for c in range(num_chunks):
+        t_start = c * chunk_size
+        t_end = min(t_start + chunk_size, T)
+
+        q_c = q[:, t_start:t_end]
+        k_c = k[:, t_start:t_end]
+        v_c = v[:, t_start:t_end]
+        g_c = g[:, t_start:t_end]
+        b_c = beta[:, t_start:t_end]
+
+        if torch.is_grad_enabled():
+            o_c, S = grad_checkpoint(
+                _kda_recurrent_chunk,
+                q_c, k_c, v_c, g_c, b_c, S,
+                use_reentrant=False,
+            )
+        else:
+            o_c, S = _kda_recurrent_chunk(q_c, k_c, v_c, g_c, b_c, S)
+
+        o_parts.append(o_c)
+
+    o = torch.cat(o_parts, dim=1)  # [B, T, H, V]
+
+    if not output_final_state:
+        S = None
+    return o.to(dtype), (S.to(dtype) if S is not None else None)
+
+
+# ---------------------------------------------------------------------------
 # KDAMemory — follows FLA's KimiDeltaAttention as closely as possible
 # ---------------------------------------------------------------------------
 
@@ -229,6 +319,7 @@ class KDAMemory(Module):
         heads = 4,
         chunk_size = 64,
         use_chunk = True,
+        use_grad_checkpoint = True,
         use_short_conv = True,
         conv_size = 4,
         conv_bias = False,
@@ -242,6 +333,7 @@ class KDAMemory(Module):
         self.dim_head = dim_head
         self.chunk_size = chunk_size
         self.use_chunk = use_chunk
+        self.use_grad_checkpoint = use_grad_checkpoint
         self.use_short_conv = use_short_conv
         self.allow_neg_eigval = allow_neg_eigval
 
@@ -345,7 +437,14 @@ class KDAMemory(Module):
         k = F.normalize(k, dim=-1)
 
         # Run KDA kernel
-        if self.use_chunk and seq_len % self.chunk_size == 0:
+        if self.use_grad_checkpoint:
+            o, new_hidden_state = kda_recurrent_checkpointed(
+                q=q, k=k, v=v, g=g, beta=beta,
+                initial_state=hidden_state,
+                output_final_state=return_state,
+                chunk_size=self.chunk_size,
+            )
+        elif self.use_chunk and seq_len % self.chunk_size == 0:
             o, new_hidden_state = naive_chunk_kda(
                 q=q, k=k, v=v, g=g, beta=beta,
                 initial_state=hidden_state,
@@ -396,8 +495,9 @@ class MultiheadRMSNorm(Module):
 
 def create_kda_memory_for_mac(
     dim,
-    chunk_size=64,
+    chunk_size=32,
     use_chunk=True,
+    use_grad_checkpoint=True,
     heads=4,
     use_short_conv=True,
     **kwargs
@@ -419,6 +519,7 @@ def create_kda_memory_for_mac(
         heads=heads,
         chunk_size=chunk_size,
         use_chunk=use_chunk,
+        use_grad_checkpoint=use_grad_checkpoint,
         use_short_conv=use_short_conv,
         **kwargs
     )
