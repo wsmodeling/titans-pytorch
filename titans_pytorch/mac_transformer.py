@@ -574,6 +574,7 @@ class MemoryAsContextTransformer(Module):
                     template = neural_memory_model
                     mem = SparseKDAMemory(
                         dim=dim,
+                        dim_head=template.dim_head,
                         heads=template.heads,
                         num_memory_slots=template.num_memory_slots,
                         top_k=template.top_k,
@@ -587,6 +588,7 @@ class MemoryAsContextTransformer(Module):
                     template = neural_memory_model
                     mem = KDAMemory(
                         dim=dim,  # Use transformer dim
+                        dim_head=template.dim_head,
                         heads=template.heads,
                         chunk_size=template.chunk_size,
                         use_chunk=template.use_chunk,
