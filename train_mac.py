@@ -45,11 +45,11 @@ SEQ_LEN = 512
 # neural memory related
 
 # Choose memory type: 'neural' (TTT-based), 'kda' (linear attention), 'sparse_kda' (SM-KDA)
-MEMORY_TYPE = 'kda'  # Options: 'neural', 'kda', 'sparse_kda'
- 
+MEMORY_TYPE = 'sparse_kda'  # Options: 'neural', 'kda', 'sparse_kda'
+
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
-NUM_LONGTERM_MEM = 4
+NUM_LONGTERM_MEM = 4 # TODO: we can set NUM_LONGTERM_MEM to 0, so only the memory matrix can retain longterm information, and see if that helps the neural memory model learn better longterm retention strategies. This also allows us to test the neural memory's ability to learn to write to the memory matrix in a way that retains longterm information, without relying on the presence of persist mem tokens which are designed to be longterm.
 NEURAL_MEM_LAYERS = (2, 4, 6)                   # layers 2, 4, 6 have neural memory, can add more
 NEURAL_MEM_GATE_ATTN_OUTPUT = False
 NEURAL_MEM_MOMENTUM = True
@@ -72,8 +72,10 @@ KDA_CHUNK_SIZE = NEURAL_MEM_SEGMENT_LEN * 8     # Chunk size for KDA (larger chu
 KDA_USE_CHUNK = True                            # Use chunked KDA (faster) vs recurrent (more flexible)
 
 # Sparse KDA settings (only used when MEMORY_TYPE = 'sparse_kda')
-SPARSE_KDA_NUM_SLOTS = 8                        # N: total number of memory matrices
-SPARSE_KDA_TOP_K = 8                            # k: how many slots each token activates
+SPARSE_KDA_NUM_SLOTS = 1                        # N: total number of memory matrices
+SPARSE_KDA_TOP_K = 1                            # k: how many slots each token activates
+SPARSE_KDA_LOG_HITRATE_EVERY = 5                # how often to log slot hit rates to wandb
+SPARSE_KDA_AUX_LOSS_WEIGHT = 0.0               # Switch Transformer load balance loss weight
 
 # experiment related
 
@@ -276,15 +278,59 @@ with profiler_context as prof:
     for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
         model.train()
 
+        total_aux_loss = None
+
         for __ in range(GRADIENT_ACCUMULATE_EVERY):
-            loss = model(next(train_loader).cuda(non_blocking = True), return_loss = True)
+            task_loss = model(next(train_loader).cuda(non_blocking = True), return_loss = True)
+            loss = task_loss
+
+            if MEMORY_TYPE == 'sparse_kda':
+                from titans_pytorch.kda_memory import SparseKDAMemory
+                for _, module in model.named_modules():
+                    if isinstance(module, SparseKDAMemory):
+                        aux = module.get_aux_loss()
+                        if aux is not None:
+                            loss = loss + SPARSE_KDA_AUX_LOSS_WEIGHT * aux
+                            total_aux_loss = aux if total_aux_loss is None else total_aux_loss + aux
+                        module.reset_aux_loss()
+
             loss.backward()
 
-        tqdm.tqdm.write(f'training loss: {loss.item():.4f}')
+        tqdm.tqdm.write(f'training loss: {task_loss.item():.4f}')
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optim.step()
         optim.zero_grad()
-        wandb.log(dict(train_loss = loss.item()), step = i)
+
+        log_dict = dict(train_loss = task_loss.item())
+        if MEMORY_TYPE == 'sparse_kda' and total_aux_loss is not None:
+            log_dict['aux_loss'] = total_aux_loss.item()
+        wandb.log(log_dict, step = i)
+
+        if MEMORY_TYPE == 'sparse_kda' and i % SPARSE_KDA_LOG_HITRATE_EVERY == 0:
+            from titans_pytorch.kda_memory import SparseKDAMemory
+            log_dict = {}
+            for name, module in model.named_modules():
+                if isinstance(module, SparseKDAMemory):
+                    rates = module.get_slot_hit_rates()
+                    avg_weights = module.get_slot_avg_weights()
+                    logit_mean, logit_std = module.get_slot_logit_stats()
+                    short_name = name.replace('_orig_mod.', '').replace('.4', '')
+                    rates_str   = ' '.join(f'{r:.3f}'  for r in rates.tolist())
+                    weights_str = ' '.join(f'{w:.4f}'  for w in avg_weights.tolist())
+                    mean_str    = ' '.join(f'{m:.4f}'  for m in logit_mean.tolist())
+                    std_str     = ' '.join(f'{s:.4f}'  for s in logit_std.tolist())
+                    tqdm.tqdm.write(f'[{short_name}] hit_rate:    [{rates_str}]')
+                    tqdm.tqdm.write(f'[{short_name}] avg_weight:  [{weights_str}]')
+                    tqdm.tqdm.write(f'[{short_name}] logit_mean:  [{mean_str}]')
+                    tqdm.tqdm.write(f'[{short_name}] logit_std:   [{std_str}]')
+                    for slot_idx in range(len(rates.tolist())):
+                        log_dict[f'slot_hit_rate/{short_name}/slot_{slot_idx}']   = rates[slot_idx].item()
+                        log_dict[f'slot_avg_weight/{short_name}/slot_{slot_idx}'] = avg_weights[slot_idx].item()
+                        log_dict[f'slot_logit_mean/{short_name}/slot_{slot_idx}'] = logit_mean[slot_idx].item()
+                        log_dict[f'slot_logit_std/{short_name}/slot_{slot_idx}']  = logit_std[slot_idx].item()
+                    module.reset_slot_stats()
+            if log_dict:
+                wandb.log(log_dict, step = i)
 
         if i % VALIDATE_EVERY == 0:
             model.eval()
