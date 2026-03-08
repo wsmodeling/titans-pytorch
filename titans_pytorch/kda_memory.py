@@ -623,9 +623,10 @@ def naive_recurrent_sparse_kda(
     Sparse Mixture-of-KDA: routes each token to top-k of N memory slots.
 
     Args:
-        q, k, v, g, beta: same as naive_recurrent_kda — [B, T, H, D]
-        router_weights: sparse routing weights [B, T, N], already top-k masked
-                        (non-selected entries are 0, selected sum ~1 per token)
+        q:            [B, T, H, D]  — shared query across all slots
+        k, v, g:      [N, B, T, H, D]  — per-slot keys / values / gates
+        beta:         [N, B, T, H]      — per-slot betas
+        router_weights: [B, T, N]  — sparse routing weights (top-k masked, sums to 1)
         initial_state: [B, N, H, K, V]
         output_final_state: whether to return final state
     Returns:
@@ -633,60 +634,52 @@ def naive_recurrent_sparse_kda(
         S: [B, N, H, K, V] or None
     """
     dtype = v.dtype
-    B, T, H, K, V = *q.shape, v.shape[-1]
+    B, T, H, K = q.shape
+    V = v.shape[-1]
     N = router_weights.shape[-1]  # number of memory slots
 
     if scale is None:
         scale = K ** -0.5
 
-    q, k, v, g, beta = map(lambda x: x.to(torch.float), [q, k, v, g, beta])
+    q = q.to(torch.float) * scale
+    k, v, g, beta = map(lambda x: x.to(torch.float), [k, v, g, beta])
     router_weights = router_weights.to(torch.float)
-    q = q * scale
 
     # S: [B, N, H, K, V]
-    S = k.new_zeros(B, N, H, K, V).to(q)
+    S = q.new_zeros(B, N, H, K, V)
     if initial_state is not None:
         S = S + initial_state
-    o = torch.zeros_like(v)
+    o = torch.zeros(B, T, H, V, dtype=torch.float, device=q.device)
 
     for i in range(T):
-        q_i  = q[:, i]      # [B, H, K]
-        k_i  = k[:, i]      # [B, H, K]
-        v_i  = v[:, i]      # [B, H, V]
-        g_i  = g[:, i]      # [B, H, K]
-        b_i  = beta[:, i]   # [B, H]
+        q_i  = q[:, i]          # [B, H, K]
+        k_i  = k[:, :, i]       # [N, B, H, K]
+        v_i  = v[:, :, i]       # [N, B, H, V]
+        g_i  = g[:, :, i]       # [N, B, H, K]
+        b_i  = beta[:, :, i]    # [N, B, H]
         r_i  = router_weights[:, i]  # [B, N]
 
-        # --- Sparse retrieval ---
-        # For each selected slot n, retrieve: q_i @ S_n
-        # Weighted sum across slots: o_i = sum_n r_i[n] * (q_i @ S_n)
-        # Shape trick: einsum over N slots
-        # retrieved[n] = einsum('bhk, bhkv -> bhv', q_i, S[:,n])
-        # o_i = sum_n r_i[:,n] * retrieved[n]
-        retrieved = torch.einsum('b h k, b n h k v -> b n h v', q_i, S)   # [B, N, H, V]
-        o[:, i] = torch.einsum('b n, b n h v -> b h v', r_i, retrieved)   # [B, H, V]
+        # --- Write: decay then delta update (per-slot), before read ---
+        # Decay: each slot uses its own per-slot gate
+        # g_i: [N, B, H, K] -> exp: [N, B, H, K, 1] broadcast with S [B, N, H, K, V]
+        S = S * g_i.permute(1, 0, 2, 3)[:, :, :, :, None].exp()  # [B, N, H, K, V]
 
-        # --- Sparse delta update ---
-        # Delta rule for each slot n, weighted by r_i[n]:
-        #   kS_n = (k_i[...,None] * S[:,n]).sum(-2)  [B, H, V]
-        #   delta_S_n = b_i * (v_i - kS_n) outer k_i  [B, H, K, V]
-        #   S[:,n] = S[:,n] * g_i.exp() + r_i[:,n] * delta_S_n
-
-        # Decay all slots identically (gating is per-head, not per-slot)
-        S = S * g_i[:, None, :, :, None].exp()  # broadcast over N
-
-        # Compute delta for ALL slots, then weight by router
-        # kS[n] = k_i @ S[n]  ->  [B, N, H, V]
-        kS = torch.einsum('b h k, b n h k v -> b n h v', k_i, S)
-        # residual = v_i - kS[n]: [B, N, H, V]
-        residual = v_i[:, None, :, :] - kS                                # [B, N, H, V]
-        # outer: b_i * residual outer k_i  -> [B, N, H, K, V]
+        # Delta rule per slot:
+        # kS[n] = k_i[n] @ S[n]  ->  [B, N, H, V]
+        kS = torch.einsum('n b h k, b n h k v -> b n h v', k_i, S)
+        # residual[n] = v_i[n] - kS[n]: [B, N, H, V]
+        residual = v_i.permute(1, 0, 2, 3) - kS                           # [B, N, H, V]
+        # delta[n] = b_i[n] * residual[n] outer k_i[n]: [B, N, H, K, V]
         delta = torch.einsum(
-            'b h, b n h v, b h k -> b n h k v',
+            'n b h, b n h v, n b h k -> b n h k v',
             b_i, residual, k_i
         )
         # Weighted update: r_i[:,n] scales each slot's delta
         S = S + r_i[:, :, None, None, None] * delta                       # [B, N, H, K, V]
+
+        # --- Read: weighted sum over slots ---
+        retrieved = torch.einsum('b h k, b n h k v -> b n h v', q_i, S)   # [B, N, H, V]
+        o[:, i] = torch.einsum('b n, b n h v -> b h v', r_i, retrieved)   # [B, H, V]
 
     if not output_final_state:
         S = None
@@ -752,27 +745,37 @@ def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S
         beta_all_i = beta_chunk[:, :, i]    # [N, B, H]
 
         # Gather per-batch top-k slots: [B, k, H, D]
-        slot_idx_k = topk_idx_i.t().unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, K)  # [k, B, H, D]
-        k_topk    = k_all_i.gather(0, slot_idx_k).permute(1, 0, 2, 3)    # [B, k, H, D]
-        v_topk    = v_all_i.gather(0, slot_idx_k.expand(-1, -1, H, V)).permute(1, 0, 2, 3)
-        g_topk    = g_all_i.gather(0, slot_idx_k).permute(1, 0, 2, 3)    # [B, k, H, D]
-        beta_topk = beta_all_i.gather(0, topk_idx_i.t().unsqueeze(-1).expand(-1, -1, H)).permute(1, 0, 2)  # [B, k, H]
+        # k_all_i: [N, B, H, D] -> [B, N, H, D], then gather along dim=1 with [B, k, H, D] index
+        k_all_i_b = k_all_i.permute(1, 0, 2, 3)      # [B, N, H, D]
+        v_all_i_b = v_all_i.permute(1, 0, 2, 3)      # [B, N, H, D]
+        g_all_i_b = g_all_i.permute(1, 0, 2, 3)      # [B, N, H, D]
+        beta_all_i_b = beta_all_i.permute(1, 0, 2)   # [B, N, H]
+
+        idx_kd = topk_idx_i[:, :, None, None].expand(-1, -1, H, K)  # [B, k, H, D]
+        idx_kv = topk_idx_i[:, :, None, None].expand(-1, -1, H, V)  # [B, k, H, V]
+        idx_kh = topk_idx_i[:, :, None].expand(-1, -1, H)           # [B, k, H]
+
+        k_topk    = k_all_i_b.gather(1, idx_kd)      # [B, k, H, D]
+        v_topk    = v_all_i_b.gather(1, idx_kv)      # [B, k, H, V]
+        g_topk    = g_all_i_b.gather(1, idx_kd)      # [B, k, H, D]
+        beta_topk = beta_all_i_b.gather(1, idx_kh)   # [B, k, H]
 
         # Decay: only top-k slots decay — unselected slots are frozen
         S_topk = S_topk * g_topk[:, :, :, :, None].exp()   # [B, k, H, D, 1] broadcast
 
-        # Read: query against top-k slots, weighted sum
-        # Note: 's' = top-k slot index, 'd' = key dim
-        retrieved = torch.einsum('b h d, b s h d v -> b s h v', q_i, S_topk)  # [B, k, H, V]
-        r_i_topk = r_i.gather(1, topk_idx_i)                                   # [B, k]
-        o_chunk[:, i] = torch.einsum('b s, b s h v -> b h v', r_i_topk, retrieved)
-
         # Write: delta rule update for top-k slots only, using per-slot k/v/beta
+        # (write before read, matching regular KDA order: decay -> write -> read)
+        r_i_topk = r_i.gather(1, topk_idx_i)                                   # [B, k]
         kS      = torch.einsum('b s h d, b s h d v -> b s h v', k_topk, S_topk)   # [B, k, H, V]
         residual = v_topk - kS                                                      # [B, k, H, V]
         delta    = torch.einsum('b s h, b s h v, b s h d -> b s h d v', beta_topk, residual, k_topk)
         weighted_delta = r_i_topk[:, :, None, None, None] * delta
         S_topk = S_topk + weighted_delta
+
+        # Read: query against top-k slots, weighted sum
+        # Note: 's' = top-k slot index, 'd' = key dim
+        retrieved = torch.einsum('b h d, b s h d v -> b s h v', q_i, S_topk)  # [B, k, H, V]
+        o_chunk[:, i] = torch.einsum('b s, b s h v -> b h v', r_i_topk, retrieved)
 
         # Scatter updated top-k slots back (non-inplace to avoid grad checkpoint issues)
         S = S.scatter(1, idx, S_topk)
@@ -1086,6 +1089,7 @@ class SparseKDAMemory(Module):
         )
 
         # Shared (dense) slot: all tokens read/write, q reused from above
+        # Add shared output before o_norm, matching MoM: o_norm(sparse_o + shared_o) * gate
         if self.shared_slot is not None:
             sk, sv, sg, sbeta = self.shared_slot(normed)
             shared_o, new_shared_hidden_state = kda_recurrent_checkpointed(

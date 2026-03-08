@@ -74,11 +74,11 @@ KDA_HEADS = 8                                   # Number of attention heads (mem
 KDA_DIM_HEAD = 128                               # Head dimension (default: dim // heads = 64)
 
 # Sparse KDA settings (only used when MEMORY_TYPE = 'sparse_kda')
-SPARSE_KDA_NUM_SLOTS = 8                        # N: total number of memory matrices
-SPARSE_KDA_TOP_K = 4                            # k: how many slots each token activates
+SPARSE_KDA_NUM_SLOTS = 1 # 8                        # N: total number of memory matrices
+SPARSE_KDA_TOP_K = 1 # 4                            # k: how many slots each token activates
 SPARSE_KDA_LOG_HITRATE_EVERY = 5                # how often to log slot hit rates to wandb
-SPARSE_KDA_AUX_LOSS_WEIGHT = 0.01               # Switch Transformer load balance loss weight
-SPARSE_KDA_USE_SHARED_MEMORY = True            # add a dense shared memory that all tokens read/write
+SPARSE_KDA_AUX_LOSS_WEIGHT = 0.0 # 0.01               # Switch Transformer load balance loss weight
+SPARSE_KDA_USE_SHARED_MEMORY = False # True            # add a dense shared memory that all tokens read/write
 
 # experiment related
 
