@@ -1045,12 +1045,85 @@ class SparseKDAMemory(Module):
         std = variance.clamp(min=0).sqrt()
         return mean, std
 
+    @torch.no_grad()
+    def _run_oracle_debug(self, q, k, v, topk_indices, hidden_state):
+        """
+        Oracle debug: compare each slot's memory output vs its causal attention oracle.
+
+        For each slot i, the oracle is causal attention using slot i's own K/V projections:
+            oracle_i = softmax(q K_i^T / sqrt(d)) V_i   (causal, over full sequence)
+
+        This measures how well each slot's recurrent state approximates its ideal attention output.
+        Also checks whether the router selects the slot closest to its own oracle.
+
+        Args:
+            q:            [B, T, H, D]   shared query
+            k:            [N, B, T, H, D] per-slot keys
+            v:            [N, B, T, H, D] per-slot values
+            topk_indices: [B, T, top_k]  router selections
+            hidden_state: [B, N, H, D, D] or None — initial recurrent state
+        """
+        N, B, T, H, D = k.shape
+        V = v.shape[-1]
+
+        # Causal attention oracle for each slot using slot i's own K/V
+        # q: [B, T, H, D] -> [B, H, T, D]
+        q_bhtd = q.float().permute(0, 2, 1, 3)
+        causal_mask = torch.full((T, T), float('-inf'), device=q.device).triu(1)
+
+        oracle_os = []
+        for i in range(N):
+            k_i = k[i].float().permute(0, 2, 1, 3)  # [B, H, T, D]
+            v_i = v[i].float().permute(0, 2, 1, 3)  # [B, H, T, V]
+            oracle_i = F.scaled_dot_product_attention(q_bhtd, k_i, v_i, attn_mask=causal_mask)
+            oracle_os.append(oracle_i.permute(0, 2, 1, 3))  # [B, T, H, V]
+        oracle_os = torch.stack(oracle_os, dim=0)  # [N, B, T, H, V]
+
+        # Memory output for each slot independently (using current hidden state)
+        # Run full recurrent forward for each slot, treating it as a single KDA
+        S = hidden_state.float() if hidden_state is not None else \
+            torch.zeros(B, N, H, D, V, device=q.device, dtype=torch.float)
+
+        mem_os = []
+        for i in range(N):
+            S_i = S[:, i]  # [B, H, D, V]
+            o_i_list = []
+            for t in range(T):
+                q_t  = q[:, t].float()          # [B, H, D]
+                o_t  = torch.einsum('b h d, b h d v -> b h v', q_t, S_i)
+                o_i_list.append(o_t)
+            mem_os.append(torch.stack(o_i_list, dim=1))  # [B, T, H, V]
+        mem_os = torch.stack(mem_os, dim=0)  # [N, B, T, H, V]
+
+        # Per-slot quality: how well memory approximates its own oracle
+        # dist[i] = mean ||mem_i - oracle_i|| over (B, T, H, V)
+        diff = mem_os - oracle_os                            # [N, B, T, H, V]
+        slot_dist = diff.pow(2).mean(dim=(-1, -2))          # [N, B, T]
+        slot_dist_mean = slot_dist.mean(dim=(1, 2))         # [N]  — per-slot quality
+
+        # Best slot per token: which slot has lowest dist to its oracle
+        best_slot = slot_dist.argmin(dim=0)                 # [B, T]
+
+        # Router top-1 accuracy vs oracle best
+        router_top1 = topk_indices[..., 0]                  # [B, T]
+        match = (router_top1 == best_slot).float()
+        random_baseline = self.top_k / N
+
+        print(f"[oracle debug]  router top-1 accuracy : {match.mean():.3f}  "
+              f"(random baseline: {random_baseline:.3f})")
+        print(f"[oracle debug]  per-slot dist to oracle: "
+              f"{[f'{d:.4f}' for d in slot_dist_mean.tolist()]}")
+        best_dist = [f'{(best_slot == i).float().mean().item():.3f}' for i in range(N)]
+        print(f"[oracle debug]  best-slot distribution : {best_dist}")
+
     def forward(
         self,
         seq,
         state: SparseKDAState | None = None,
         return_state=True,
     ):
+        debug_oracle = getattr(self, '_oracle_debug_next', False)
+        self._oracle_debug_next = False  # consume the flag — only fires once
         batch, seq_len = seq.shape[:2]
 
         if not exists(state):
@@ -1077,6 +1150,9 @@ class SparseKDAMemory(Module):
 
         # Sparse routing weights [B, T, N] and top-k indices [B, T, k]
         router_weights, topk_indices = self._route(normed)
+
+        if debug_oracle:
+            self._run_oracle_debug(q, k, v, topk_indices, hidden_state)
 
         o, new_hidden_state = naive_recurrent_sparse_kda_checkpointed(
             q=q, k=k, v=v, g=g, beta=beta,

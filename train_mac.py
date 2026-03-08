@@ -78,7 +78,8 @@ SPARSE_KDA_NUM_SLOTS = 8 # 8                        # N: total number of memory 
 SPARSE_KDA_TOP_K = 4 # 4                            # k: how many slots each token activates
 SPARSE_KDA_LOG_HITRATE_EVERY = 5                # how often to log slot hit rates to wandb
 SPARSE_KDA_AUX_LOSS_WEIGHT = 0.0 # 0.01               # Switch Transformer load balance loss weight
-SPARSE_KDA_USE_SHARED_MEMORY = True # True            # add a dense shared memory that all tokens read/write
+SPARSE_KDA_USE_SHARED_MEMORY = False # True            # add a dense shared memory that all tokens read/write
+SPARSE_KDA_ORACLE_DEBUG_EVERY = 5             # how often to run oracle debug (0 = disabled)
 
 # experiment related
 
@@ -123,6 +124,14 @@ def decode_token(token):
 
 def decode_tokens(tokens):
     return ''.join(list(map(decode_token, tokens)))
+
+def set_sparse_kda_oracle_debug(model, step):
+    """Set oracle debug flag on all SparseKDAMemory modules — fires on the next forward pass."""
+    from titans_pytorch.kda_memory import SparseKDAMemory
+    for name, module in model.named_modules():
+        if isinstance(module, SparseKDAMemory):
+            module._oracle_debug_next = True
+    tqdm.tqdm.write(f'\n[oracle debug scheduled @ step {step}]')
 
 # memory model
 
@@ -350,6 +359,9 @@ with profiler_context as prof:
                 val_loss = model(next(val_loader).cuda(non_blocking = True), return_loss = True)
                 tqdm.tqdm.write(f'validation loss: {val_loss.item():.4f}')
                 wandb.log(dict(val_loss = val_loss.item()), step = i)
+
+        if MEMORY_TYPE == 'sparse_kda' and SPARSE_KDA_ORACLE_DEBUG_EVERY > 0 and i % SPARSE_KDA_ORACLE_DEBUG_EVERY == 0:
+            set_sparse_kda_oracle_debug(model, i)
 
         if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
             model.eval()
