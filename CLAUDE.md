@@ -25,3 +25,9 @@ o = q @ S                        # read
 k_all_i_b = k_all_i.permute(1, 0, 2, 3)
 k_topk = k_all_i_b.gather(1, topk_idx_i[:,:,None,None].expand(-1,-1,H,K))
 ```
+
+## Running / Debugging
+
+```bash
+export UV_CACHE_DIR="/workspace/wshao/uv_cache" && export UV_PYTHON_INSTALL_DIR="/workspace/wshao/uv_cache/python" && export UV_DATA_DIR="/workspace/wshao/uv_cache/data" && uv run train_mac.py
+```

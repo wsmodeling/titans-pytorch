@@ -32,8 +32,8 @@ from titans_pytorch import (
 # constants
 
 NUM_BATCHES = int(1e5)
-BATCH_SIZE = 32
-GRADIENT_ACCUMULATE_EVERY = 2
+BATCH_SIZE = 16
+GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
@@ -74,18 +74,20 @@ KDA_HEADS = 8                                   # Number of attention heads (mem
 KDA_DIM_HEAD = 128                               # Head dimension (default: dim // heads = 64)
 
 # Sparse KDA settings (only used when MEMORY_TYPE = 'sparse_kda')
-SPARSE_KDA_NUM_SLOTS = 1 # 8                        # N: total number of memory matrices
-SPARSE_KDA_TOP_K = 1 # 4                            # k: how many slots each token activates
+SPARSE_KDA_NUM_SLOTS = 8 # 8                        # N: total number of memory matrices
+SPARSE_KDA_TOP_K = 4 # 4                            # k: how many slots each token activates
 SPARSE_KDA_LOG_HITRATE_EVERY = 5                # how often to log slot hit rates to wandb
 SPARSE_KDA_AUX_LOSS_WEIGHT = 0.0 # 0.01               # Switch Transformer load balance loss weight
-SPARSE_KDA_USE_SHARED_MEMORY = False # True            # add a dense shared memory that all tokens read/write
+SPARSE_KDA_USE_SHARED_MEMORY = True # True            # add a dense shared memory that all tokens read/write
 
 # experiment related
 
 PROJECT_NAME = 'titans-mac-transformer'
-_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} d={KDA_DIM_HEAD}{"  +shared" if SPARSE_KDA_USE_SHARED_MEMORY else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
+_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} h={KDA_HEADS} d={KDA_DIM_HEAD}{"  +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
 _kda_suffix = f' h={KDA_HEADS} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'kda' else ''
-RUN_NAME = f'mac-{MEMORY_TYPE}{_sparse_kda_suffix}{_kda_suffix} - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}, seq_len {SEQ_LEN}'
+# run name abbreviations: N=num_slots, k=top_k, h=heads, d=dim_head, +sh=shared_memory
+#   lm=num_longterm_mem, ly=neural_mem_layers, sq=seq_len, bs=batch_size, ga=gradient_accumulate_every
+RUN_NAME = f'mac-{MEMORY_TYPE}{_sparse_kda_suffix}{_kda_suffix} lm={NUM_LONGTERM_MEM} ly={NEURAL_MEM_LAYERS} sq={SEQ_LEN} bs={BATCH_SIZE} ga={GRADIENT_ACCUMULATE_EVERY}'
 WANDB_ONLINE = True # turn this on to pipe experiment to cloud
 
 # perf related
