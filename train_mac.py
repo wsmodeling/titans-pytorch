@@ -80,6 +80,7 @@ SPARSE_KDA_LOG_HITRATE_EVERY = 5                # how often to log slot hit rate
 SPARSE_KDA_AUX_LOSS_WEIGHT = 0.0 # 0.01               # Switch Transformer load balance loss weight
 SPARSE_KDA_USE_SHARED_MEMORY = False # True            # add a dense shared memory that all tokens read/write
 SPARSE_KDA_ORACLE_DEBUG_EVERY = 5             # how often to run oracle debug (0 = disabled)
+SPARSE_KDA_DISTILL_LOSS_WEIGHT = 0.1          # weight for oracle distillation loss (0 = disabled)
 
 # experiment related
 
@@ -299,6 +300,24 @@ with profiler_context as prof:
     for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
         model.train()
 
+        # Log oracle debug results from previous step's forward (if any)
+        if MEMORY_TYPE == 'sparse_kda':
+            from titans_pytorch.kda_memory import SparseKDAMemory
+            oracle_log = {}
+            for name, module in model.named_modules():
+                if isinstance(module, SparseKDAMemory):
+                    results = getattr(module, '_oracle_debug_results', None)
+                    if results is not None:
+                        short_name = name.replace('_orig_mod.', '')
+                        oracle_log[f'oracle/{short_name}/router_accuracy'] = results['router_accuracy']
+                        oracle_log[f'oracle/{short_name}/random_baseline']  = results['random_baseline']
+                        for slot_idx, (dist, best) in enumerate(zip(results['slot_dist'], results['best_slot_dist'])):
+                            oracle_log[f'oracle/{short_name}/slot_{slot_idx}_dist']      = dist
+                            oracle_log[f'oracle/{short_name}/slot_{slot_idx}_best_frac'] = best
+                        module._oracle_debug_results = None
+            if oracle_log:
+                wandb.log(oracle_log, step=i)
+
         total_aux_loss = None
 
         for __ in range(GRADIENT_ACCUMULATE_EVERY):
@@ -314,6 +333,10 @@ with profiler_context as prof:
                             loss = loss + SPARSE_KDA_AUX_LOSS_WEIGHT * aux
                             total_aux_loss = aux if total_aux_loss is None else total_aux_loss + aux
                         module.reset_aux_loss()
+                        distill = module.get_distill_loss()
+                        if distill is not None:
+                            loss = loss + SPARSE_KDA_DISTILL_LOSS_WEIGHT * distill
+                        module.reset_distill_loss()
 
             loss.backward()
 

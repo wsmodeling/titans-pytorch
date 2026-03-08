@@ -951,6 +951,11 @@ class SparseKDAMemory(Module):
         self._aux_loss_accum = None  # summed aux_loss tensors (stays on compute graph)
         self._aux_loss_count = 0     # number of forward passes accumulated
 
+        # Oracle distillation loss accumulator
+        self._distill_loss_accum = None
+        self._distill_loss_count = 0
+        self.oracle_distill_temperature = 1.0  # softmax temperature for soft labels
+
     def _route(self, x):
         """
         Compute sparse top-k routing weights.
@@ -1025,6 +1030,16 @@ class SparseKDAMemory(Module):
     def reset_aux_loss(self):
         self._aux_loss_accum = None
         self._aux_loss_count = 0
+
+    def get_distill_loss(self):
+        """Return accumulated mean oracle distillation loss (retains compute graph)."""
+        if self._distill_loss_accum is None or self._distill_loss_count == 0:
+            return None
+        return self._distill_loss_accum / self._distill_loss_count
+
+    def reset_distill_loss(self):
+        self._distill_loss_accum = None
+        self._distill_loss_count = 0
 
     def get_slot_hit_rates(self):
         """Fraction of tokens that selected each slot via top-k (normalized, sums to 1)."""
@@ -1109,12 +1124,26 @@ class SparseKDAMemory(Module):
         match = (router_top1 == best_slot).float()
         random_baseline = self.top_k / N
 
-        print(f"[oracle debug]  router top-1 accuracy : {match.mean():.3f}  "
+        router_accuracy = match.mean().item()
+        best_slot_dist = [(best_slot == i).float().mean().item() for i in range(N)]
+
+        print(f"[oracle debug]  router top-1 accuracy : {router_accuracy:.3f}  "
               f"(random baseline: {random_baseline:.3f})")
         print(f"[oracle debug]  per-slot dist to oracle: "
               f"{[f'{d:.4f}' for d in slot_dist_mean.tolist()]}")
-        best_dist = [f'{(best_slot == i).float().mean().item():.3f}' for i in range(N)]
-        print(f"[oracle debug]  best-slot distribution : {best_dist}")
+        print(f"[oracle debug]  best-slot distribution : "
+              f"{[f'{d:.3f}' for d in best_slot_dist]}")
+
+        # Store results for external logging (e.g. wandb)
+        self._oracle_debug_results = dict(
+            router_accuracy=router_accuracy,
+            random_baseline=random_baseline,
+            slot_dist=slot_dist_mean.tolist(),       # [N]
+            best_slot_dist=best_slot_dist,           # [N]
+        )
+
+        # Return slot_dist for distillation loss computation (still in no_grad context)
+        return slot_dist  # [N, B, T]
 
     def forward(
         self,
@@ -1152,7 +1181,23 @@ class SparseKDAMemory(Module):
         router_weights, topk_indices = self._route(normed)
 
         if debug_oracle:
-            self._run_oracle_debug(q, k, v, topk_indices, hidden_state)
+            slot_dist = self._run_oracle_debug(q, k, v, topk_indices, hidden_state)
+            # slot_dist: [N, B, T], no_grad — use as soft labels for router
+            # soft_label[b,t,i] ∝ exp(-dist[i,b,t] / T), lower dist → higher label
+            # router_logits: [B, T, N], has grad
+            router_logits = self.router(normed)  # [B, T, N], recompute with grad
+            slot_dist_bt = slot_dist.permute(1, 2, 0)          # [B, T, N]
+            soft_labels = (-slot_dist_bt / self.oracle_distill_temperature).softmax(dim=-1).detach()
+            distill_loss = F.kl_div(
+                router_logits.log_softmax(dim=-1),
+                soft_labels,
+                reduction='batchmean',
+            )
+            if self._distill_loss_accum is None:
+                self._distill_loss_accum = distill_loss
+            else:
+                self._distill_loss_accum = self._distill_loss_accum + distill_loss
+            self._distill_loss_count += 1
 
         o, new_hidden_state = naive_recurrent_sparse_kda_checkpointed(
             q=q, k=k, v=v, g=g, beta=beta,
