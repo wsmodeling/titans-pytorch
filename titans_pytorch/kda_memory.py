@@ -294,6 +294,83 @@ def kda_recurrent_checkpointed(
 
 
 # ---------------------------------------------------------------------------
+# KDASlot — a single KDA memory slot (K/V/gate/beta projections)
+# Shared by both SparseKDAMemory (N slots) and the optional dense shared slot.
+# Does NOT hold recurrent state — state is managed by the parent module.
+# ---------------------------------------------------------------------------
+
+class KDASlot(Module):
+    """
+    A single KDA memory slot: projects input to K, V, gate (g), and beta.
+    The query (Q) is shared across all slots and computed by the parent module.
+
+    Returns (k, v, g, beta) ready for the KDA recurrence kernel.
+    """
+    def __init__(
+        self,
+        dim,
+        heads,
+        dim_head,
+        use_short_conv=True,
+        conv_size=4,
+        conv_bias=False,
+        allow_neg_eigval=False,
+    ):
+        super().__init__()
+        self.heads = heads
+        self.allow_neg_eigval = allow_neg_eigval
+        self.use_short_conv = use_short_conv
+
+        key_dim = heads * dim_head
+        value_dim = heads * dim_head  # expand_v=1 for simplicity
+
+        self.k_proj = Linear(dim, key_dim, bias=False)
+        self.v_proj = Linear(dim, value_dim, bias=False)
+        self.f_proj = nn.Sequential(
+            Linear(dim, dim_head, bias=False),
+            Linear(dim_head, key_dim, bias=False),
+        )
+        self.A_log = Parameter(torch.log(torch.empty(heads, dtype=torch.float32).uniform_(1, 16)))
+        self.dt_bias = Parameter(torch.zeros(key_dim, dtype=torch.float32))
+        self.b_proj = Linear(dim, heads, bias=False)
+
+        if use_short_conv:
+            self.k_conv1d = ShortConvolution(key_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
+            self.v_conv1d = ShortConvolution(value_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
+
+    def forward(self, normed):
+        """
+        Args:
+            normed: [B, T, dim]  (pre-normed input)
+        Returns:
+            k:    [B, T, H, D]
+            v:    [B, T, H, D]
+            g:    [B, T, H, D]  (KDA gate, always <= 0)
+            beta: [B, T, H]
+        """
+        if self.use_short_conv:
+            k = self.k_conv1d(self.k_proj(normed))
+            v = self.v_conv1d(self.v_proj(normed))
+        else:
+            k = F.silu(self.k_proj(normed))
+            v = F.silu(self.v_proj(normed))
+
+        g = self.f_proj(normed)
+        beta = self.b_proj(normed).sigmoid()
+
+        k, g = (rearrange(x, 'b t (h d) -> b t h d', h=self.heads) for x in (k, g))
+        v = rearrange(v, 'b t (h d) -> b t h d', h=self.heads)
+
+        if self.allow_neg_eigval:
+            beta = beta * 2.0
+
+        g = naive_kda_gate(g, self.A_log, self.dt_bias)
+        k = F.normalize(k, dim=-1)
+
+        return k, v, g, beta
+
+
+# ---------------------------------------------------------------------------
 # KDAMemory — follows FLA's KimiDeltaAttention as closely as possible
 # ---------------------------------------------------------------------------
 
@@ -628,11 +705,22 @@ def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S
     Each slot only decays and updates when it is selected (top-k). Unselected slots
     are frozen — their state is preserved exactly until the next time they are activated.
     This prevents unselected slots from decaying to zero over long sequences.
+
+    Args:
+        q_chunk:    [B, T_c, H, D]
+        k_chunk:    [N, B, T_c, H, D]  — per-slot keys
+        v_chunk:    [N, B, T_c, H, D]  — per-slot values
+        g_chunk:    [N, B, T_c, H, D]  — per-slot gates
+        beta_chunk: [N, B, T_c, H]     — per-slot betas
+        r_chunk:    [B, T_c, N]        — routing weights
+        S_in:       [B, N, H, D, D]    — recurrent state
+        topk_indices: [B, T_c, k]
     """
     dtype = v_chunk.dtype
     T_c = q_chunk.shape[1]
     B, _, H, K = q_chunk.shape
     V = v_chunk.shape[-1]
+    N = k_chunk.shape[0]
 
     q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk = map(
         lambda x: x.to(torch.float), [q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk]
@@ -643,38 +731,51 @@ def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S
     o_chunk = torch.zeros(B, T_c, H, V, dtype=torch.float, device=q_chunk.device)
 
     for i in range(T_c):
-        q_i = q_chunk[:, i]        # [B, H, K]
-        k_i = k_chunk[:, i]        # [B, H, K]
-        v_i = v_chunk[:, i]        # [B, H, V]
-        g_i = g_chunk[:, i]        # [B, H, K]
-        b_i = beta_chunk[:, i]     # [B, H]
-        r_i = r_chunk[:, i]        # [B, N]
-        topk_idx_i = topk_indices[:, i]  # [B, k]
+        q_i       = q_chunk[:, i]           # [B, H, K]
+        r_i       = r_chunk[:, i]           # [B, N]
+        topk_idx_i = topk_indices[:, i]     # [B, k]
+        top_k = topk_idx_i.shape[1]
 
-        # idx: [B, k, H, K, V] — expanded indices for gather/scatter
+        # idx: [B, k, H, K, V] — expanded indices for gather/scatter on S
         idx = topk_idx_i[:, :, None, None, None].expand(-1, -1, H, K, V)
 
-        # Gather top-k slots
-        S_topk = S.gather(1, idx)  # [B, k, H, K, V]
+        # Gather top-k slots from recurrent state
+        S_topk = S.gather(1, idx)           # [B, k, H, K, V]
+
+        # Per-slot k/v/g/beta for the selected top-k slots only
+        # k_chunk[n] = [B, T_c, H, D], gather along slot dim
+        # topk_idx_i: [B, k] — need to index k_chunk along N dim per batch
+        # Rearrange: k_chunk[:, :, i] -> [N, B, H, D], then gather top-k
+        k_all_i    = k_chunk[:, :, i]       # [N, B, H, D]
+        v_all_i    = v_chunk[:, :, i]       # [N, B, H, D]
+        g_all_i    = g_chunk[:, :, i]       # [N, B, H, D]
+        beta_all_i = beta_chunk[:, :, i]    # [N, B, H]
+
+        # Gather per-batch top-k slots: [B, k, H, D]
+        slot_idx_k = topk_idx_i.t().unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, K)  # [k, B, H, D]
+        k_topk    = k_all_i.gather(0, slot_idx_k).permute(1, 0, 2, 3)    # [B, k, H, D]
+        v_topk    = v_all_i.gather(0, slot_idx_k.expand(-1, -1, H, V)).permute(1, 0, 2, 3)
+        g_topk    = g_all_i.gather(0, slot_idx_k).permute(1, 0, 2, 3)    # [B, k, H, D]
+        beta_topk = beta_all_i.gather(0, topk_idx_i.t().unsqueeze(-1).expand(-1, -1, H)).permute(1, 0, 2)  # [B, k, H]
 
         # Decay: only top-k slots decay — unselected slots are frozen
-        S_topk = S_topk * g_i[:, None, :, :, None].exp()
+        S_topk = S_topk * g_topk[:, :, :, :, None].exp()   # [B, k, H, D, 1] broadcast
 
         # Read: query against top-k slots, weighted sum
-        # Note: 's' = top-k slot index, 'd' = key/head dim (avoid collision with 'k')
+        # Note: 's' = top-k slot index, 'd' = key dim
         retrieved = torch.einsum('b h d, b s h d v -> b s h v', q_i, S_topk)  # [B, k, H, V]
         r_i_topk = r_i.gather(1, topk_idx_i)                                   # [B, k]
         o_chunk[:, i] = torch.einsum('b s, b s h v -> b h v', r_i_topk, retrieved)
 
-        # Write: delta rule update for top-k slots only
-        kS = torch.einsum('b h d, b s h d v -> b s h v', k_i, S_topk)         # [B, k, H, V]
-        residual = v_i[:, None, :, :] - kS                                      # [B, k, H, V]
-        delta = torch.einsum('b h, b s h v, b h d -> b s h d v', b_i, residual, k_i)  # [B, k, H, K, V]
-        weighted_delta = r_i_topk[:, :, None, None, None] * delta              # [B, k, H, K, V]
+        # Write: delta rule update for top-k slots only, using per-slot k/v/beta
+        kS      = torch.einsum('b s h d, b s h d v -> b s h v', k_topk, S_topk)   # [B, k, H, V]
+        residual = v_topk - kS                                                      # [B, k, H, V]
+        delta    = torch.einsum('b s h, b s h v, b s h d -> b s h d v', beta_topk, residual, k_topk)
+        weighted_delta = r_i_topk[:, :, None, None, None] * delta
         S_topk = S_topk + weighted_delta
 
-        # Scatter updated top-k slots back (replace, not add)
-        S.scatter_(1, idx, S_topk)
+        # Scatter updated top-k slots back (non-inplace to avoid grad checkpoint issues)
+        S = S.scatter(1, idx, S_topk)
 
     return o_chunk.to(dtype), S.to(dtype)
 
@@ -706,7 +807,8 @@ def naive_recurrent_sparse_kda_checkpointed(
                      per-slot update frequency when top_k < N. Typically N/top_k.
     """
     dtype = v.dtype
-    B, T, H, K, V_dim = *q.shape, v.shape[-1]
+    B, T, H, K = q.shape
+    V_dim = v.shape[-1]
     N = router_weights.shape[-1]
 
     if scale is None:
@@ -729,12 +831,12 @@ def naive_recurrent_sparse_kda_checkpointed(
         t_start = c * chunk_size
         t_end = min(t_start + chunk_size, T)
 
-        q_c = q[:, t_start:t_end]
-        k_c = k[:, t_start:t_end]
-        v_c = v[:, t_start:t_end]
-        g_c = g[:, t_start:t_end]
-        b_c = beta[:, t_start:t_end]
-        r_c = router_weights[:, t_start:t_end]
+        q_c    = q[:, t_start:t_end]
+        k_c    = k[:, :, t_start:t_end]       # [N, B, chunk, H, D]
+        v_c    = v[:, :, t_start:t_end]
+        g_c    = g[:, :, t_start:t_end]
+        b_c    = beta[:, :, t_start:t_end]    # [N, B, chunk, H]
+        r_c    = router_weights[:, t_start:t_end]
         topk_c = topk_indices[:, t_start:t_end]   # [B, chunk_size, k]
 
         # grad_checkpoint passes all args through and saves/restores them
@@ -809,45 +911,24 @@ class SparseKDAMemory(Module):
 
         self.norm = nn.RMSNorm(dim)
 
-        # Q, K, V projections
+        # Q projection (shared across all slots — all slots use the same query)
         self.q_proj = Linear(dim, key_dim, bias=False)
-        self.k_proj = Linear(dim, key_dim, bias=False)
-        self.v_proj = Linear(dim, value_dim, bias=False)
-
         if use_short_conv:
             self.q_conv1d = ShortConvolution(key_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
-            self.k_conv1d = ShortConvolution(key_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
-            self.v_conv1d = ShortConvolution(value_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
 
-        # Gate projection (KDA decay gate, same as KDAMemory)
-        self.f_proj = nn.Sequential(
-            Linear(dim, head_v_dim, bias=False),
-            Linear(head_v_dim, key_dim, bias=False),
+        # N sparse slots — each is an independent KDASlot
+        slot_kwargs = dict(
+            dim=dim, heads=heads, dim_head=dim_head,
+            use_short_conv=use_short_conv, conv_size=conv_size, conv_bias=conv_bias,
+            allow_neg_eigval=allow_neg_eigval,
         )
-        self.A_log = Parameter(torch.log(torch.empty(heads, dtype=torch.float32).uniform_(1, 16)))
-        self.dt_bias = Parameter(torch.zeros(key_dim, dtype=torch.float32))
-
-        # Beta
-        self.b_proj = Linear(dim, heads, bias=False)
+        self.slots = nn.ModuleList([KDASlot(**slot_kwargs) for _ in range(num_memory_slots)])
 
         # Router: projects x -> N logits, then top-k sparse softmax
         self.router = Linear(dim, num_memory_slots, bias=False)
 
-        # Shared (dense) memory: all tokens read/write, independent KDA state
-        # Uses separate Q/K/V/gate/beta projections to keep it independent
-        if use_shared_memory:
-            self.shared_k_proj = Linear(dim, key_dim, bias=False)
-            self.shared_v_proj = Linear(dim, value_dim, bias=False)
-            self.shared_f_proj = nn.Sequential(
-                Linear(dim, head_v_dim, bias=False),
-                Linear(head_v_dim, key_dim, bias=False),
-            )
-            self.shared_A_log = Parameter(torch.log(torch.empty(heads, dtype=torch.float32).uniform_(1, 16)))
-            self.shared_dt_bias = Parameter(torch.zeros(key_dim, dtype=torch.float32))
-            self.shared_b_proj = Linear(dim, heads, bias=False)
-            if use_short_conv:
-                self.shared_k_conv1d = ShortConvolution(key_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
-                self.shared_v_conv1d = ShortConvolution(value_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
+        # Optional shared (dense) slot: all tokens read/write, independent KDASlot
+        self.shared_slot = KDASlot(**slot_kwargs) if use_shared_memory else None
 
         # Output gate
         self.g_proj = nn.Sequential(
@@ -975,29 +1056,21 @@ class SparseKDAMemory(Module):
 
         normed = self.norm(seq)
 
-        # Q, K, V
+        # Q: shared across all slots
         if self.use_short_conv:
             q = self.q_conv1d(self.q_proj(normed))
-            k = self.k_conv1d(self.k_proj(normed))
-            v = self.v_conv1d(self.v_proj(normed))
         else:
             q = F.silu(self.q_proj(normed))
-            k = F.silu(self.k_proj(normed))
-            v = F.silu(self.v_proj(normed))
-
-        g = self.f_proj(normed)
-        beta = self.b_proj(normed).sigmoid()             # [B, T, H]
-
-        q, k, g = (rearrange(x, 'b t (h d) -> b t h d', h=self.heads) for x in (q, k, g))
-        v = rearrange(v, 'b t (h d) -> b t h d', h=self.heads)
-
-        if self.allow_neg_eigval:
-            beta = beta * 2.0
-
-        g = naive_kda_gate(g, self.A_log, self.dt_bias)
-
+        q = rearrange(q, 'b t (h d) -> b t h d', h=self.heads)
         q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
+
+        # K, V, g, beta: each sparse slot computes its own via KDASlot
+        # Stack results: k/v/g [N, B, T, H, D], beta [N, B, T, H]
+        slot_outputs = [slot(normed) for slot in self.slots]
+        k    = torch.stack([o[0] for o in slot_outputs], dim=0)   # [N, B, T, H, D]
+        v    = torch.stack([o[1] for o in slot_outputs], dim=0)
+        g    = torch.stack([o[2] for o in slot_outputs], dim=0)
+        beta = torch.stack([o[3] for o in slot_outputs], dim=0)   # [N, B, T, H]
 
         # Sparse routing weights [B, T, N] and top-k indices [B, T, k]
         router_weights, topk_indices = self._route(normed)
@@ -1012,23 +1085,9 @@ class SparseKDAMemory(Module):
             write_scale=1.0,
         )
 
-        # Shared (dense) memory: all tokens read/write a single KDA state
-        if self.use_shared_memory:
-            if self.use_short_conv:
-                sk = self.shared_k_conv1d(self.shared_k_proj(normed))
-                sv = self.shared_v_conv1d(self.shared_v_proj(normed))
-            else:
-                sk = F.silu(self.shared_k_proj(normed))
-                sv = F.silu(self.shared_v_proj(normed))
-
-            sg = self.shared_f_proj(normed)
-            sbeta = self.shared_b_proj(normed).sigmoid()
-            sk, sg = (rearrange(x, 'b t (h d) -> b t h d', h=self.heads) for x in (sk, sg))
-            sv = rearrange(sv, 'b t (h d) -> b t h d', h=self.heads)
-            sk = F.normalize(sk, dim=-1)
-            sg = naive_kda_gate(sg, self.shared_A_log, self.shared_dt_bias)
-
-            # q is shared with the sparse memory (same query projection)
+        # Shared (dense) slot: all tokens read/write, q reused from above
+        if self.shared_slot is not None:
+            sk, sv, sg, sbeta = self.shared_slot(normed)
             shared_o, new_shared_hidden_state = kda_recurrent_checkpointed(
                 q=q, k=sk, v=sv, g=sg, beta=sbeta,
                 initial_state=shared_hidden_state,
