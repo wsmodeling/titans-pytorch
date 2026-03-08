@@ -78,11 +78,12 @@ SPARSE_KDA_NUM_SLOTS = 8                        # N: total number of memory matr
 SPARSE_KDA_TOP_K = 4                            # k: how many slots each token activates
 SPARSE_KDA_LOG_HITRATE_EVERY = 5                # how often to log slot hit rates to wandb
 SPARSE_KDA_AUX_LOSS_WEIGHT = 0.01               # Switch Transformer load balance loss weight
+SPARSE_KDA_USE_SHARED_MEMORY = True            # add a dense shared memory that all tokens read/write
 
 # experiment related
 
 PROJECT_NAME = 'titans-mac-transformer'
-_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'sparse_kda' else ''
+_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} d={KDA_DIM_HEAD}{"  +shared" if SPARSE_KDA_USE_SHARED_MEMORY else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
 _kda_suffix = f' h={KDA_HEADS} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'kda' else ''
 RUN_NAME = f'mac-{MEMORY_TYPE}{_sparse_kda_suffix}{_kda_suffix} - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}, seq_len {SEQ_LEN}'
 WANDB_ONLINE = True # turn this on to pipe experiment to cloud
@@ -143,6 +144,7 @@ elif MEMORY_TYPE == 'sparse_kda':
     print(f"Using Sparse KDA Memory (SM-KDA)")
     print(f"  - Num memory slots (N): {SPARSE_KDA_NUM_SLOTS}")
     print(f"  - Top-k per token: {SPARSE_KDA_TOP_K}")
+    print(f"  - Shared memory: {SPARSE_KDA_USE_SHARED_MEMORY}")
 
     neural_memory_model = create_sparse_kda_memory_for_mac(
         dim = 64,
@@ -150,6 +152,7 @@ elif MEMORY_TYPE == 'sparse_kda':
         top_k = SPARSE_KDA_TOP_K,
         heads = KDA_HEADS,
         dim_head = KDA_DIM_HEAD,
+        use_shared_memory = SPARSE_KDA_USE_SHARED_MEMORY,
     )
 elif USE_MEM_ATTENTION_MODEL:
     print("Using Memory Attention Model")

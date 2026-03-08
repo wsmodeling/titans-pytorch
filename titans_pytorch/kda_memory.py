@@ -26,7 +26,8 @@ KDAState = namedtuple('KDAState', [
 # Sparse KDA state: hidden_state is [B, N, H, K, V] (N memory slots)
 SparseKDAState = namedtuple('SparseKDAState', [
     'seq_index',
-    'hidden_state',  # [B, N, H, K, V]
+    'hidden_state',         # [B, N, H, K, V]
+    'shared_hidden_state',  # [B, H, K, V] or None (only used when use_shared_memory=True)
 ])
 
 def exists(v):
@@ -788,6 +789,7 @@ class SparseKDAMemory(Module):
         conv_bias=False,
         allow_neg_eigval=False,
         norm_eps=1e-5,
+        use_shared_memory=False,
     ):
         super().__init__()
         dim_head = default(dim_head, dim // heads)
@@ -798,6 +800,7 @@ class SparseKDAMemory(Module):
         self.top_k = top_k
         self.use_short_conv = use_short_conv
         self.allow_neg_eigval = allow_neg_eigval
+        self.use_shared_memory = use_shared_memory
 
         head_k_dim = dim_head
         head_v_dim = dim_head
@@ -829,6 +832,22 @@ class SparseKDAMemory(Module):
 
         # Router: projects x -> N logits, then top-k sparse softmax
         self.router = Linear(dim, num_memory_slots, bias=False)
+
+        # Shared (dense) memory: all tokens read/write, independent KDA state
+        # Uses separate Q/K/V/gate/beta projections to keep it independent
+        if use_shared_memory:
+            self.shared_k_proj = Linear(dim, key_dim, bias=False)
+            self.shared_v_proj = Linear(dim, value_dim, bias=False)
+            self.shared_f_proj = nn.Sequential(
+                Linear(dim, head_v_dim, bias=False),
+                Linear(head_v_dim, key_dim, bias=False),
+            )
+            self.shared_A_log = Parameter(torch.log(torch.empty(heads, dtype=torch.float32).uniform_(1, 16)))
+            self.shared_dt_bias = Parameter(torch.zeros(key_dim, dtype=torch.float32))
+            self.shared_b_proj = Linear(dim, heads, bias=False)
+            if use_short_conv:
+                self.shared_k_conv1d = ShortConvolution(key_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
+                self.shared_v_conv1d = ShortConvolution(value_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
 
         # Output gate
         self.g_proj = nn.Sequential(
@@ -951,8 +970,8 @@ class SparseKDAMemory(Module):
         batch, seq_len = seq.shape[:2]
 
         if not exists(state):
-            state = SparseKDAState(0, None)
-        seq_index, hidden_state = state
+            state = SparseKDAState(0, None, None)
+        seq_index, hidden_state, shared_hidden_state = state
 
         normed = self.norm(seq)
 
@@ -981,13 +1000,7 @@ class SparseKDAMemory(Module):
         k = F.normalize(k, dim=-1)
 
         # Sparse routing weights [B, T, N] and top-k indices [B, T, k]
-        # TODO: currently read and write sparse memory are using the same slots
-        # "Currently, I'm using a shared router for both reading and writing to ensure semantic consistency within each memory slot—essentially treating each slot as a specialized 'expert' for certain types of information. However, we could explore decoupled routers as a future extension to allow the model to retrieve context from one domain while storing updates in another, potentially enhancing its cross-domain reasoning."
         router_weights, topk_indices = self._route(normed)
-
-        # write_scale=1.0: routing weights are already renormalized within top-k,
-        # so each selected slot receives a properly weighted update (no extra scaling needed).
-        write_scale = 1.0
 
         o, new_hidden_state = naive_recurrent_sparse_kda_checkpointed(
             q=q, k=k, v=v, g=g, beta=beta,
@@ -996,8 +1009,35 @@ class SparseKDAMemory(Module):
             initial_state=hidden_state,
             output_final_state=return_state,
             chunk_size=32,
-            write_scale=write_scale,
+            write_scale=1.0,
         )
+
+        # Shared (dense) memory: all tokens read/write a single KDA state
+        if self.use_shared_memory:
+            if self.use_short_conv:
+                sk = self.shared_k_conv1d(self.shared_k_proj(normed))
+                sv = self.shared_v_conv1d(self.shared_v_proj(normed))
+            else:
+                sk = F.silu(self.shared_k_proj(normed))
+                sv = F.silu(self.shared_v_proj(normed))
+
+            sg = self.shared_f_proj(normed)
+            sbeta = self.shared_b_proj(normed).sigmoid()
+            sk, sg = (rearrange(x, 'b t (h d) -> b t h d', h=self.heads) for x in (sk, sg))
+            sv = rearrange(sv, 'b t (h d) -> b t h d', h=self.heads)
+            sk = F.normalize(sk, dim=-1)
+            sg = naive_kda_gate(sg, self.shared_A_log, self.shared_dt_bias)
+
+            # q is shared with the sparse memory (same query projection)
+            shared_o, new_shared_hidden_state = kda_recurrent_checkpointed(
+                q=q, k=sk, v=sv, g=sg, beta=sbeta,
+                initial_state=shared_hidden_state,
+                output_final_state=return_state,
+                chunk_size=32,
+            )
+            o = o + shared_o
+        else:
+            new_shared_hidden_state = None
 
         gate = rearrange(self.g_proj(normed), 'b t (h d) -> b t h d', h=self.heads).sigmoid()
         o = self.o_norm(o) * gate
@@ -1006,7 +1046,7 @@ class SparseKDAMemory(Module):
         o = self.o_proj(o)
 
         if return_state:
-            new_state = SparseKDAState(seq_index + seq_len, new_hidden_state)
+            new_state = SparseKDAState(seq_index + seq_len, new_hidden_state, new_shared_hidden_state)
         else:
             new_state = None
 
@@ -1019,6 +1059,7 @@ def create_sparse_kda_memory_for_mac(
     num_memory_slots=8,
     top_k=2,
     use_short_conv=True,
+    use_shared_memory=False,
     **kwargs
 ):
     """
@@ -1037,5 +1078,6 @@ def create_sparse_kda_memory_for_mac(
         num_memory_slots=num_memory_slots,
         top_k=top_k,
         use_short_conv=use_short_conv,
+        use_shared_memory=use_shared_memory,
         **kwargs
     )
