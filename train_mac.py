@@ -79,13 +79,13 @@ SPARSE_KDA_TOP_K = 4 # 4                            # k: how many slots each tok
 SPARSE_KDA_LOG_HITRATE_EVERY = 5                # how often to log slot hit rates to wandb
 SPARSE_KDA_AUX_LOSS_WEIGHT = 0.0 # 0.01               # Switch Transformer load balance loss weight
 SPARSE_KDA_USE_SHARED_MEMORY = False # True            # add a dense shared memory that all tokens read/write
-SPARSE_KDA_ORACLE_DEBUG_EVERY = 5             # how often to run oracle debug (0 = disabled)
+SPARSE_KDA_DISTILL_EVERY = 5                  # how often to run oracle debug + distillation loss (0 = disabled)
 SPARSE_KDA_DISTILL_LOSS_WEIGHT = 0.1          # weight for oracle distillation loss (0 = disabled)
 
 # experiment related
 
 PROJECT_NAME = 'titans-mac-transformer'
-_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} h={KDA_HEADS} d={KDA_DIM_HEAD}{"  +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
+_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} h={KDA_HEADS} d={KDA_DIM_HEAD}{"  +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""}{ f" dl={SPARSE_KDA_DISTILL_LOSS_WEIGHT}@{SPARSE_KDA_DISTILL_EVERY}" if SPARSE_KDA_DISTILL_LOSS_WEIGHT > 0 else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
 _kda_suffix = f' h={KDA_HEADS} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'kda' else ''
 # run name abbreviations: N=num_slots, k=top_k, h=heads, d=dim_head, +sh=shared_memory
 #   lm=num_longterm_mem, ly=neural_mem_layers, sq=seq_len, bs=batch_size, ga=gradient_accumulate_every
@@ -383,7 +383,7 @@ with profiler_context as prof:
                 tqdm.tqdm.write(f'validation loss: {val_loss.item():.4f}')
                 wandb.log(dict(val_loss = val_loss.item()), step = i)
 
-        if MEMORY_TYPE == 'sparse_kda' and SPARSE_KDA_ORACLE_DEBUG_EVERY > 0 and i % SPARSE_KDA_ORACLE_DEBUG_EVERY == 0:
+        if MEMORY_TYPE == 'sparse_kda' and SPARSE_KDA_DISTILL_EVERY > 0 and i % SPARSE_KDA_DISTILL_EVERY == 0:
             set_sparse_kda_oracle_debug(model, i)
 
         if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
