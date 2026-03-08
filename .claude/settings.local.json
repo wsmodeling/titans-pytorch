@@ -20,7 +20,8 @@
       "Bash(apt-get install:*)",
       "Bash(apt-cache search:*)",
       "Bash(conda install:*)",
-      "WebFetch(domain:arxiv.org)"
+      "WebFetch(domain:arxiv.org)",
+      "Bash(git clone https://github.com/OpenSparseLLMs/MoM.git refs/MoM)"
     ],
     "additionalDirectories": [
       "/tmp"

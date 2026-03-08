@@ -624,15 +624,9 @@ def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S
     """
     Process one chunk of the sparse KDA recurrence (for gradient checkpointing).
 
-    Optimization: only gather and compute read/write for the top-k selected slots
-    per token (MoE-style), then scatter updates back to the full state S.
-    Decay still applies to all N slots since unselected slots must not freeze.
-
-    Args:
-        write_scale: scalar multiplier applied to write weights only (not read weights).
-                     Set to N/top_k to compensate for reduced per-slot update frequency
-                     when top_k < N, keeping effective write magnitude comparable to
-                     a single-slot KDA.
+    Each slot only decays and updates when it is selected (top-k). Unselected slots
+    are frozen — their state is preserved exactly until the next time they are activated.
+    This prevents unselected slots from decaying to zero over long sequences.
     """
     dtype = v_chunk.dtype
     T_c = q_chunk.shape[1]
@@ -656,27 +650,30 @@ def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S
         r_i = r_chunk[:, i]        # [B, N]
         topk_idx_i = topk_indices[:, i]  # [B, k]
 
-        # Decay: ALL N slots decay (unselected slots must not freeze in time)
-        S = S * g_i[:, None, :, :, None].exp()
-
-        # Gather only top-k slots for read and write: O(k) instead of O(N)
         # idx: [B, k, H, K, V] — expanded indices for gather/scatter
         idx = topk_idx_i[:, :, None, None, None].expand(-1, -1, H, K, V)
+
+        # Gather top-k slots
         S_topk = S.gather(1, idx)  # [B, k, H, K, V]
 
-        # Read: query against only top-k slots (unscaled — read weights are a weighted average)
+        # Decay: only top-k slots decay — unselected slots are frozen
+        S_topk = S_topk * g_i[:, None, :, :, None].exp()
+
+        # Read: query against top-k slots, weighted sum
         # Note: 's' = top-k slot index, 'd' = key/head dim (avoid collision with 'k')
         retrieved = torch.einsum('b h d, b s h d v -> b s h v', q_i, S_topk)  # [B, k, H, V]
         r_i_topk = r_i.gather(1, topk_idx_i)                                   # [B, k]
         o_chunk[:, i] = torch.einsum('b s, b s h v -> b h v', r_i_topk, retrieved)
 
-        # Write: delta only for top-k slots, then scatter back
-        # write_scale compensates for reduced update frequency when top_k < N
+        # Write: delta rule update for top-k slots only
         kS = torch.einsum('b h d, b s h d v -> b s h v', k_i, S_topk)         # [B, k, H, V]
         residual = v_i[:, None, :, :] - kS                                      # [B, k, H, V]
         delta = torch.einsum('b h, b s h v, b h d -> b s h d v', b_i, residual, k_i)  # [B, k, H, K, V]
-        weighted_delta = (write_scale * r_i_topk)[:, :, None, None, None] * delta     # [B, k, H, K, V]
-        S.scatter_add_(1, idx, weighted_delta)
+        weighted_delta = r_i_topk[:, :, None, None, None] * delta              # [B, k, H, K, V]
+        S_topk = S_topk + weighted_delta
+
+        # Scatter updated top-k slots back (replace, not add)
+        S.scatter_(1, idx, S_topk)
 
     return o_chunk.to(dtype), S.to(dtype)
 
@@ -861,12 +858,11 @@ class SparseKDAMemory(Module):
             topk_idx: [B, T, k]  — indices of the k selected slots per token
         """
         logits = self.router(x)                          # [B, T, N]
-        # top-k mask
-        topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # [B, T, k]
-        # scatter back to full size, masked softmax
-        mask = torch.full_like(logits, float('-inf'))
-        mask.scatter_(-1, topk_idx, topk_vals)
-        weights = mask.softmax(dim=-1)                   # [B, T, N], k non-zero per token
+        # MoM-style routing: softmax first, then top-k, then renormalize
+        scores = logits.float().softmax(dim=-1)          # [B, T, N], bounded in (0, 1)
+        topk_vals, topk_idx = scores.topk(self.top_k, dim=-1)  # [B, T, k]
+        topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True)  # renormalize within top-k
+        weights = torch.zeros_like(scores).scatter_(-1, topk_idx, topk_vals).to(logits.dtype)  # [B, T, N]
 
         with torch.no_grad():
             # Hit counts: how many tokens selected each slot
@@ -899,7 +895,7 @@ class SparseKDAMemory(Module):
         topk_onehot = torch.zeros_like(logits)
         topk_onehot.scatter_(-1, topk_idx, 1.0)
         f = topk_onehot.detach().float().sum(dim=(0, 1)) / (B * T * self.top_k)  # [N], sums to 1
-        P = logits.float().softmax(dim=-1).mean(dim=(0, 1))                       # [N], differentiable
+        P = scores.mean(dim=(0, 1))                                                # [N], differentiable
         aux_loss = N * (f * P).sum()
 
         if self._aux_loss_accum is None:
@@ -989,9 +985,9 @@ class SparseKDAMemory(Module):
         # "Currently, I'm using a shared router for both reading and writing to ensure semantic consistency within each memory slot—essentially treating each slot as a specialized 'expert' for certain types of information. However, we could explore decoupled routers as a future extension to allow the model to retrieve context from one domain while storing updates in another, potentially enhancing its cross-domain reasoning."
         router_weights, topk_indices = self._route(normed)
 
-        # Rescale write weights by N/top_k so each slot receives the same total
-        # update magnitude on average as a single-slot KDA would.
-        write_scale = self.num_memory_slots / self.top_k
+        # write_scale=1.0: routing weights are already renormalized within top-k,
+        # so each selected slot receives a properly weighted update (no extra scaling needed).
+        write_scale = 1.0
 
         o, new_hidden_state = naive_recurrent_sparse_kda_checkpointed(
             q=q, k=k, v=v, g=g, beta=beta,

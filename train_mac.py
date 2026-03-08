@@ -32,7 +32,7 @@ from titans_pytorch import (
 # constants
 
 NUM_BATCHES = int(1e5)
-BATCH_SIZE = 128
+BATCH_SIZE = 32
 GRADIENT_ACCUMULATE_EVERY = 2
 LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
@@ -40,12 +40,12 @@ GENERATE_EVERY  = 500
 PRIME_LENGTH = 100
 GENERATE_LENGTH = 512
 SHOULD_GENERATE = True
-SEQ_LEN = 512
+SEQ_LEN = 2048 # if SEQ_LEN is 512, KDA memory size has 8 x 128 entries which can cover all tokens already, even for 2048 seq len, the first 8 x 128 tokens won't benefit from KDA memory.
 
 # neural memory related
 
 # Choose memory type: 'neural' (TTT-based), 'kda' (linear attention), 'sparse_kda' (SM-KDA)
-MEMORY_TYPE = 'kda'  # Options: 'neural', 'kda', 'sparse_kda'
+MEMORY_TYPE = 'sparse_kda'  # Options: 'neural', 'kda', 'sparse_kda'
 
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
@@ -84,7 +84,7 @@ SPARSE_KDA_AUX_LOSS_WEIGHT = 0.01               # Switch Transformer load balanc
 PROJECT_NAME = 'titans-mac-transformer'
 _sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'sparse_kda' else ''
 _kda_suffix = f' h={KDA_HEADS} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'kda' else ''
-RUN_NAME = f'mac-{MEMORY_TYPE}{_sparse_kda_suffix}{_kda_suffix} - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
+RUN_NAME = f'mac-{MEMORY_TYPE}{_sparse_kda_suffix}{_kda_suffix} - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}, seq_len {SEQ_LEN}'
 WANDB_ONLINE = True # turn this on to pipe experiment to cloud
 
 # perf related
