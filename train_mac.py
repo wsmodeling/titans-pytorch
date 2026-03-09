@@ -77,15 +77,15 @@ KDA_DIM_HEAD = 128                               # Head dimension (default: dim 
 SPARSE_KDA_NUM_SLOTS = 8 # 8                        # N: total number of memory matrices
 SPARSE_KDA_TOP_K = 4 # 4                            # k: how many slots each token activates
 SPARSE_KDA_LOG_HITRATE_EVERY = 5                # how often to log slot hit rates to wandb
-SPARSE_KDA_AUX_LOSS_WEIGHT = 0.0 # 0.01               # Switch Transformer load balance loss weight
+SPARSE_KDA_AUX_LOSS_WEIGHT = 0.01 # 0.01               # Switch Transformer load balance loss weight
 SPARSE_KDA_USE_SHARED_MEMORY = False # True            # add a dense shared memory that all tokens read/write
 SPARSE_KDA_DISTILL_EVERY = 5                  # how often to run oracle debug + distillation loss (0 = disabled)
-SPARSE_KDA_DISTILL_LOSS_WEIGHT = 0.1          # weight for oracle distillation loss (0 = disabled)
+SPARSE_KDA_DISTILL_LOSS_WEIGHT = 0.0          # weight for oracle distillation loss (0 = disabled)
 
 # experiment related
 
 PROJECT_NAME = 'titans-mac-transformer'
-_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} h={KDA_HEADS} d={KDA_DIM_HEAD}{"  +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""}{ f" dl={SPARSE_KDA_DISTILL_LOSS_WEIGHT}@{SPARSE_KDA_DISTILL_EVERY}" if SPARSE_KDA_DISTILL_LOSS_WEIGHT > 0 else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
+_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} h={KDA_HEADS} d={KDA_DIM_HEAD}{"  +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""}{ f" aux={SPARSE_KDA_AUX_LOSS_WEIGHT}" if SPARSE_KDA_AUX_LOSS_WEIGHT > 0 else ""}{ f" dl={SPARSE_KDA_DISTILL_LOSS_WEIGHT}@{SPARSE_KDA_DISTILL_EVERY}" if SPARSE_KDA_DISTILL_LOSS_WEIGHT > 0 else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
 _kda_suffix = f' h={KDA_HEADS} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'kda' else ''
 # run name abbreviations: N=num_slots, k=top_k, h=heads, d=dim_head, +sh=shared_memory
 #   lm=num_longterm_mem, ly=neural_mem_layers, sq=seq_len, bs=batch_size, ga=gradient_accumulate_every
