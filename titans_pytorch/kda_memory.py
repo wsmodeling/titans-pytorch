@@ -927,8 +927,22 @@ class SparseKDAMemory(Module):
         )
         self.slots = nn.ModuleList([KDASlot(**slot_kwargs) for _ in range(num_memory_slots)])
 
-        # Router: projects x -> N logits, then top-k sparse softmax
-        self.router = Linear(dim, num_memory_slots, bias=False)
+        # Router: autoencoder-style
+        #   MLP_enc: key_dim -> router_hidden -> N  (expand then compress to slot logits)
+        #   MLP_dec: N -> router_hidden -> key_dim  (expand then reconstruct query emb)
+        # router_hidden > key_dim: expand first to relax input info before compressing to N slots.
+        # The N-dim logit space is the true bottleneck.
+        router_hidden = key_dim * 2
+        self.router_enc = nn.Sequential(
+            Linear(key_dim, router_hidden, bias=False),
+            nn.SiLU(),
+        )
+        self.router_fc = Linear(router_hidden, num_memory_slots, bias=False)
+        self.router_dec = nn.Sequential(
+            Linear(num_memory_slots, router_hidden, bias=False),
+            nn.SiLU(),
+            Linear(router_hidden, key_dim, bias=False),
+        )
 
         # Optional shared (dense) slot: all tokens read/write, independent KDASlot
         self.shared_slot = KDASlot(**slot_kwargs) if use_shared_memory else None
@@ -947,9 +961,9 @@ class SparseKDAMemory(Module):
         self.register_buffer('_slot_logit_sq_sum', torch.zeros(num_memory_slots), persistent=False)
         self._slot_weight_n = 0  # number of (batch, token) pairs accumulated
 
-        # Switch Transformer load balance auxiliary loss accumulator
-        self._aux_loss_accum = None  # summed aux_loss tensors (stays on compute graph)
-        self._aux_loss_count = 0     # number of forward passes accumulated
+        # Router reconstruction loss accumulator
+        self._recon_loss_accum = None
+        self._recon_loss_count = 0
 
         # Oracle distillation loss accumulator
         self._distill_loss_accum = None
@@ -958,59 +972,47 @@ class SparseKDAMemory(Module):
 
     def _route(self, x):
         """
-        Compute sparse top-k routing weights.
+        Compute sparse top-k routing weights via autoencoder router.
+
+        Router architecture:
+            MLP_enc(x) -> hidden -> router_fc -> slot_logits [B,T,N]
+                                              -> MLP_dec    -> x_hat [B,T,dim]
+        Reconstruction loss: MSE(x_hat, sg(x)) gives the router a self-supervised
+        signal to learn meaningful slot assignments without needing load-balance loss.
+
         Args:
-            x: [B, T, dim]
+            x: [B, T, key_dim]  — flat query embedding (all heads concatenated, post-conv)
         Returns:
             router_weights: [B, T, N]  — sparse, sums to 1 over selected k slots
             topk_idx: [B, T, k]  — indices of the k selected slots per token
         """
-        logits = self.router(x)                          # [B, T, N]
-        # MoM-style routing: softmax first, then top-k, then renormalize
-        scores = logits.float().softmax(dim=-1)          # [B, T, N], bounded in (0, 1)
+        hidden = self.router_enc(x)                      # [B, T, router_hidden]
+        logits = self.router_fc(hidden)                  # [B, T, N]
+
+        # Reconstruction loss: decode from logits (pre-softmax)
+        x_hat = self.router_dec(logits)                  # [B, T, dim]
+        recon_loss = F.mse_loss(x_hat, x.detach())
+        if self._recon_loss_accum is None:
+            self._recon_loss_accum = recon_loss
+        else:
+            self._recon_loss_accum = self._recon_loss_accum + recon_loss
+        self._recon_loss_count += 1
+
+        # Routing: top-k from softmax scores, then renormalize
+        scores = logits.float().softmax(dim=-1)          # [B, T, N]
         topk_vals, topk_idx = scores.topk(self.top_k, dim=-1)  # [B, T, k]
-        topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True)  # renormalize within top-k
-        weights = torch.zeros_like(scores).scatter_(-1, topk_idx, topk_vals).to(logits.dtype)  # [B, T, N]
+        topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
+        weights = torch.zeros_like(scores).scatter_(-1, topk_idx, topk_vals).to(logits.dtype)
 
         with torch.no_grad():
-            # Hit counts: how many tokens selected each slot
             counts = torch.zeros(self.num_memory_slots, device=x.device)
             counts.scatter_add_(0, topk_idx.reshape(-1), torch.ones(topk_idx.numel(), device=x.device))
             self._slot_hit_counts += counts
-
-            # Average weights
-            self._slot_weight_sum += weights.sum(dim=(0, 1))  # [N]
-
-            # Logit mean and variance across all tokens
-            logits_flat = logits.float()  # [B, T, N]
-            self._slot_logit_sum += logits_flat.sum(dim=(0, 1))       # [N]
-            self._slot_logit_sq_sum += (logits_flat ** 2).sum(dim=(0, 1))  # [N]
-
-            self._slot_weight_n += x.shape[0] * x.shape[1]   # B * T
-
-        # Switch Transformer load balance auxiliary loss
-        # L_aux = N * sum_i( f_i * P_i )
-        # f_i: fraction of tokens routed to slot i (stop-gradient)
-        # P_i: mean full softmax prob for slot i (differentiable, provides gradient)
-        # TODO: Switch Transformer aux loss has known issues with load collapse in practice.
-        #       DeepSeek-V2/V3 tech reports describe an improved auxiliary-loss-free strategy
-        #       using a per-slot bias term added to the router logits before top-k selection
-        #       (not affecting the routing weights themselves), updated with a simple online
-        #       rule: bias_i += gamma if slot i is overloaded, else bias_i -= gamma.
-        #       Consider replacing this loss with that bias-based approach to avoid the
-        #       tension between the task loss gradient and the aux loss gradient.
-        B, T, N = logits.shape
-        topk_onehot = torch.zeros_like(logits)
-        topk_onehot.scatter_(-1, topk_idx, 1.0)
-        f = topk_onehot.detach().float().sum(dim=(0, 1)) / (B * T * self.top_k)  # [N], sums to 1
-        P = scores.mean(dim=(0, 1))                                                # [N], differentiable
-        aux_loss = N * (f * P).sum()
-
-        if self._aux_loss_accum is None:
-            self._aux_loss_accum = aux_loss
-        else:
-            self._aux_loss_accum = self._aux_loss_accum + aux_loss
-        self._aux_loss_count += 1
+            self._slot_weight_sum += weights.sum(dim=(0, 1))
+            logits_flat = logits.float()
+            self._slot_logit_sum += logits_flat.sum(dim=(0, 1))
+            self._slot_logit_sq_sum += (logits_flat ** 2).sum(dim=(0, 1))
+            self._slot_weight_n += x.shape[0] * x.shape[1]
 
         return weights, topk_idx
 
@@ -1021,15 +1023,15 @@ class SparseKDAMemory(Module):
         self._slot_logit_sq_sum.zero_()
         self._slot_weight_n = 0
 
-    def get_aux_loss(self):
-        """Return the accumulated mean load balance aux loss (retains compute graph for backprop)."""
-        if self._aux_loss_accum is None or self._aux_loss_count == 0:
+    def get_recon_loss(self):
+        """Return accumulated mean router reconstruction loss (retains compute graph for backprop)."""
+        if self._recon_loss_accum is None or self._recon_loss_count == 0:
             return None
-        return self._aux_loss_accum / self._aux_loss_count
+        return self._recon_loss_accum / self._recon_loss_count
 
-    def reset_aux_loss(self):
-        self._aux_loss_accum = None
-        self._aux_loss_count = 0
+    def reset_recon_loss(self):
+        self._recon_loss_accum = None
+        self._recon_loss_count = 0
 
     def get_distill_loss(self):
         """Return accumulated mean oracle distillation loss (retains compute graph)."""
@@ -1163,10 +1165,10 @@ class SparseKDAMemory(Module):
 
         # Q: shared across all slots
         if self.use_short_conv:
-            q = self.q_conv1d(self.q_proj(normed))
+            q_flat = self.q_conv1d(self.q_proj(normed))  # [B, T, H*D]
         else:
-            q = F.silu(self.q_proj(normed))
-        q = rearrange(q, 'b t (h d) -> b t h d', h=self.heads)
+            q_flat = F.silu(self.q_proj(normed))          # [B, T, H*D]
+        q = rearrange(q_flat, 'b t (h d) -> b t h d', h=self.heads)
         q = F.normalize(q, dim=-1)
 
         # K, V, g, beta: each sparse slot computes its own via KDASlot
@@ -1178,14 +1180,15 @@ class SparseKDAMemory(Module):
         beta = torch.stack([o[3] for o in slot_outputs], dim=0)   # [N, B, T, H]
 
         # Sparse routing weights [B, T, N] and top-k indices [B, T, k]
-        router_weights, topk_indices = self._route(normed)
+        # q_flat: [B, T, H*D] — the actual query emb used by all slots
+        router_weights, topk_indices = self._route(q_flat)
 
         if debug_oracle:
             slot_dist = self._run_oracle_debug(q, k, v, topk_indices, hidden_state)
             # slot_dist: [N, B, T], no_grad — use as soft labels for router
             # soft_label[b,t,i] ∝ exp(-dist[i,b,t] / T), lower dist → higher label
             # router_logits: [B, T, N], has grad
-            router_logits = self.router(normed)  # [B, T, N], recompute with grad
+            router_logits = self.router_fc(self.router_enc(q_flat))  # [B, T, N], recompute with grad
             slot_dist_bt = slot_dist.permute(1, 2, 0)          # [B, T, N]
             soft_labels = (-slot_dist_bt / self.oracle_distill_temperature).softmax(dim=-1).detach()
             distill_loss = F.kl_div(
