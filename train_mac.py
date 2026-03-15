@@ -170,6 +170,12 @@ if USE_AMP:
 
 model = torch.compile(model)
 
+if MEMORY_TYPE == 'sparse_kda':
+    from titans_pytorch.kda_memory import SparseKDAMemory
+    for _, module in model.named_modules():
+        if isinstance(module, SparseKDAMemory):
+            module.enable_residual_logging()
+
 # prepare enwik8 data
 
 with gzip.open('./data/enwik8.gz') as file:
@@ -332,6 +338,13 @@ with profiler_context as prof:
                         log_dict[f'slot_logit_mean/{short_name}/slot_{slot_idx}'] = logit_mean[slot_idx].item()
                         log_dict[f'slot_logit_std/{short_name}/slot_{slot_idx}']  = logit_std[slot_idx].item()
                     module.reset_slot_stats()
+                    # residual_norm: mean |v - kS| from the last token of the last chunk per forward call.
+                    # Lower = memory has better recall for the keys it sees. Reflects learning trend.
+                    residual_norm = module.get_residual_norm()
+                    if residual_norm is not None:
+                        log_dict[f'residual_norm/{short_name}'] = residual_norm
+                        tqdm.tqdm.write(f'[{short_name}] residual_norm: {residual_norm:.4f}')
+                    module.reset_residual_norm()
             if log_dict:
                 wandb.log(log_dict, step = i)
 

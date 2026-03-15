@@ -691,7 +691,7 @@ def naive_recurrent_sparse_kda(
 # ---------------------------------------------------------------------------
 
 @torch.compiler.disable
-def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S_in, topk_indices, write_scale=1.0):
+def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S_in, topk_indices, write_scale=1.0, residual_log=None):
     """
     Process one chunk of the sparse KDA recurrence (for gradient checkpointing).
 
@@ -768,6 +768,9 @@ def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S
         r_i_topk = r_i.gather(1, topk_idx_i)                                   # [B, k]
         kS      = torch.einsum('b s h d, b s h d v -> b s h v', k_topk, S_topk)   # [B, k, H, V]
         residual = v_topk - kS                                                      # [B, k, H, V]
+        if residual_log is not None:
+            residual_log.clear()
+            residual_log.append(residual.detach().abs().mean().item())
         delta    = torch.einsum('b s h, b s h v, b s h d -> b s h d v', beta_topk, residual, k_topk)
         weighted_delta = r_i_topk[:, :, None, None, None] * delta
         S_topk = S_topk + weighted_delta
@@ -797,6 +800,7 @@ def naive_recurrent_sparse_kda_checkpointed(
     output_final_state: bool = False,
     chunk_size: int = 32,
     write_scale: float = 1.0,
+    residual_log: list | None = None,
 ):
     """
     Chunked sparse KDA with gradient checkpointing for memory efficiency.
@@ -847,11 +851,11 @@ def naive_recurrent_sparse_kda_checkpointed(
         if torch.is_grad_enabled():
             o_c, S = grad_checkpoint(
                 _sparse_kda_chunk,
-                q_c, k_c, v_c, g_c, b_c, r_c, S, topk_c, write_scale,
+                q_c, k_c, v_c, g_c, b_c, r_c, S, topk_c, write_scale, residual_log,
                 use_reentrant=False,
             )
         else:
-            o_c, S = _sparse_kda_chunk(q_c, k_c, v_c, g_c, b_c, r_c, S, topk_c, write_scale)
+            o_c, S = _sparse_kda_chunk(q_c, k_c, v_c, g_c, b_c, r_c, S, topk_c, write_scale, residual_log)
 
         o_parts.append(o_c)
 
@@ -970,6 +974,11 @@ class SparseKDAMemory(Module):
         self._recon_loss_accum = None
         self._recon_loss_count = 0
 
+        # Delta rule residual norm (no grad, logging only)
+        self._residual_log = None          # set to a list [] to enable logging
+        self._residual_norm_sum = 0.0
+        self._residual_norm_count = 0
+
         # Oracle distillation loss accumulator
         self._distill_loss_accum = None
         self._distill_loss_count = 0
@@ -1047,6 +1056,22 @@ class SparseKDAMemory(Module):
     def reset_distill_loss(self):
         self._distill_loss_accum = None
         self._distill_loss_count = 0
+
+    def enable_residual_logging(self):
+        self._residual_log = []
+
+    def disable_residual_logging(self):
+        self._residual_log = None
+
+    def get_residual_norm(self):
+        """Mean |v - kS| over accumulated forward calls. Returns None if not enabled or no data."""
+        if self._residual_norm_count == 0:
+            return None
+        return self._residual_norm_sum / self._residual_norm_count
+
+    def reset_residual_norm(self):
+        self._residual_norm_sum = 0.0
+        self._residual_norm_count = 0
 
     def get_slot_hit_rates(self):
         """Fraction of tokens that selected each slot via top-k (normalized, sums to 1)."""
@@ -1215,7 +1240,11 @@ class SparseKDAMemory(Module):
             output_final_state=return_state,
             chunk_size=32,
             write_scale=1.0,
+            residual_log=self._residual_log,
         )
+        if self._residual_log is not None and self._residual_log:
+            self._residual_norm_sum += self._residual_log[0]
+            self._residual_norm_count += 1
 
         # Shared (dense) slot: all tokens read/write, q reused from above
         # Add shared output before o_norm, matching MoM: o_norm(sparse_o + shared_o) * gate
