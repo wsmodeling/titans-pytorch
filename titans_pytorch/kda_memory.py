@@ -900,6 +900,7 @@ class SparseKDAMemory(Module):
         norm_eps=1e-5,
         use_shared_memory=False,
         router_hidden=None,
+        router_loss_type='recon',
     ):
         super().__init__()
         dim_head = default(dim_head, dim // heads)
@@ -911,6 +912,8 @@ class SparseKDAMemory(Module):
         self.use_short_conv = use_short_conv
         self.allow_neg_eigval = allow_neg_eigval
         self.use_shared_memory = use_shared_memory
+        assert router_loss_type in ('recon', 'bal'), f"router_loss_type must be 'recon' or 'bal', got {router_loss_type!r}"
+        self.router_loss_type = router_loss_type
 
         head_k_dim = dim_head
         head_v_dim = dim_head
@@ -970,9 +973,11 @@ class SparseKDAMemory(Module):
         self.register_buffer('_slot_logit_sq_sum', torch.zeros(num_memory_slots), persistent=False)
         self._slot_weight_n = 0  # number of (batch, token) pairs accumulated
 
-        # Router reconstruction loss accumulator
+        # Router loss accumulator (recon or bal, depending on router_loss_type)
         self._recon_loss_accum = None
         self._recon_loss_count = 0
+        self._bal_loss_accum = None
+        self._bal_loss_count = 0
 
         # Delta rule residual norm (no grad, logging only)
         self._residual_log = None          # set to a list [] to enable logging
@@ -986,13 +991,13 @@ class SparseKDAMemory(Module):
 
     def _route(self, x):
         """
-        Compute sparse top-k routing weights via autoencoder router.
+        Compute sparse top-k routing weights.
 
-        Router architecture:
-            MLP_enc(x) -> hidden -> router_fc -> slot_logits [B,T,N]
-                                              -> MLP_dec    -> x_hat [B,T,dim]
-        Reconstruction loss: MSE(x_hat, sg(x)) gives the router a self-supervised
-        signal to learn meaningful slot assignments without needing load-balance loss.
+        Two router loss modes (set via router_loss_type):
+          'recon': autoencoder reconstruction loss — MSE(router_dec(logits), sg(x))
+          'bal':   Switch Transformer load balance loss — N * sum(f_i * P_i)
+                   f_i = fraction of tokens routed to slot i (stop-grad)
+                   P_i = mean softmax prob for slot i (differentiable)
 
         Args:
             x: [B, T, key_dim]  — flat query embedding (all heads concatenated, post-conv)
@@ -1003,20 +1008,33 @@ class SparseKDAMemory(Module):
         hidden = self.router_enc(x)                      # [B, T, router_hidden]
         logits = self.router_fc(hidden)                  # [B, T, N]
 
-        # Reconstruction loss: decode from logits (pre-softmax)
-        x_hat = self.router_dec(logits)                  # [B, T, dim]
-        recon_loss = F.mse_loss(x_hat, x.detach())
-        if self._recon_loss_accum is None:
-            self._recon_loss_accum = recon_loss
-        else:
-            self._recon_loss_accum = self._recon_loss_accum + recon_loss
-        self._recon_loss_count += 1
-
         # Routing: top-k from softmax scores, then renormalize
         scores = logits.float().softmax(dim=-1)          # [B, T, N]
         topk_vals, topk_idx = scores.topk(self.top_k, dim=-1)  # [B, T, k]
         topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
         weights = torch.zeros_like(scores).scatter_(-1, topk_idx, topk_vals).to(logits.dtype)
+
+        # Router auxiliary loss
+        if self.router_loss_type == 'recon':
+            x_hat = self.router_dec(logits)              # [B, T, key_dim]
+            router_loss = F.mse_loss(x_hat, x.detach())
+            if self._recon_loss_accum is None:
+                self._recon_loss_accum = router_loss
+            else:
+                self._recon_loss_accum = self._recon_loss_accum + router_loss
+            self._recon_loss_count += 1
+        else:  # 'bal'
+            B, T, N = logits.shape
+            topk_onehot = torch.zeros_like(logits)
+            topk_onehot.scatter_(-1, topk_idx, 1.0)
+            f = topk_onehot.detach().float().sum(dim=(0, 1)) / (B * T * self.top_k)  # [N], stop-grad
+            P = scores.mean(dim=(0, 1))                                                # [N], differentiable
+            router_loss = N * (f * P).sum()
+            if self._bal_loss_accum is None:
+                self._bal_loss_accum = router_loss
+            else:
+                self._bal_loss_accum = self._bal_loss_accum + router_loss
+            self._bal_loss_count += 1
 
         with torch.no_grad():
             counts = torch.zeros(self.num_memory_slots, device=x.device)
@@ -1046,6 +1064,16 @@ class SparseKDAMemory(Module):
     def reset_recon_loss(self):
         self._recon_loss_accum = None
         self._recon_loss_count = 0
+
+    def get_bal_loss(self):
+        """Return accumulated mean Switch Transformer load balance loss (retains compute graph for backprop)."""
+        if self._bal_loss_accum is None or self._bal_loss_count == 0:
+            return None
+        return self._bal_loss_accum / self._bal_loss_count
+
+    def reset_bal_loss(self):
+        self._bal_loss_accum = None
+        self._bal_loss_count = 0
 
     def get_distill_loss(self):
         """Return accumulated mean oracle distillation loss (retains compute graph)."""

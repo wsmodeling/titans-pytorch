@@ -580,6 +580,7 @@ class MemoryAsContextTransformer(Module):
                         top_k=template.top_k,
                         use_short_conv=template.use_short_conv,
                         allow_neg_eigval=template.allow_neg_eigval,
+                        router_loss_type=template.router_loss_type,
                     )
                     mem_qkv_layer_selector = None
                 elif is_kda_memory:

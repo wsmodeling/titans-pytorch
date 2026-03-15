@@ -44,7 +44,9 @@ KDA_DIM_HEAD = 128                              # Head dimension (default: dim /
 SPARSE_KDA_NUM_SLOTS = 8                        # N: total number of memory matrices
 SPARSE_KDA_TOP_K = 4                            # k: how many slots each token activates
 SPARSE_KDA_LOG_HITRATE_EVERY = 5                # how often to log slot hit rates to wandb
-SPARSE_KDA_RECON_LOSS_WEIGHT = 0.5              # weight for router reconstruction loss (autoencoder)
+SPARSE_KDA_ROUTER_LOSS_TYPE = 'recon'           # 'recon' = autoencoder reconstruction loss; 'bal' = Switch Transformer load balance loss
+SPARSE_KDA_RECON_LOSS_WEIGHT = 0.5              # weight for router reconstruction loss (used when ROUTER_LOSS_TYPE='recon')
+SPARSE_KDA_BAL_LOSS_WEIGHT = 0.01              # weight for Switch Transformer load balance loss (used when ROUTER_LOSS_TYPE='bal')
 SPARSE_KDA_USE_SHARED_MEMORY = False            # add a dense shared memory that all tokens read/write
 SPARSE_KDA_DISTILL_EVERY = 5                    # how often to run oracle debug + distillation loss (0 = disabled)
 SPARSE_KDA_DISTILL_LOSS_WEIGHT = 0.00           # weight for oracle distillation loss (0 = disabled)

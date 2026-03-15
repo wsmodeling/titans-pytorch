@@ -57,7 +57,8 @@ if os.path.abspath(_config_path) != os.path.abspath(_default_path):
 # RUN_NAME: config file name prefix + auto-generated suffix from config constants
 # run name abbreviations: N=num_slots, k=top_k, h=heads, d=dim_head, +sh=shared_memory
 #   lm=num_longterm_mem, ly=neural_mem_layers, sq=seq_len, bs=batch_size, ga=gradient_accumulate_every
-_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} h={KDA_HEADS} d={KDA_DIM_HEAD}{"  +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""}{ f" rc={SPARSE_KDA_RECON_LOSS_WEIGHT}" if SPARSE_KDA_RECON_LOSS_WEIGHT > 0 else ""}{ f" dl={SPARSE_KDA_DISTILL_LOSS_WEIGHT}@{SPARSE_KDA_DISTILL_EVERY}" if SPARSE_KDA_DISTILL_LOSS_WEIGHT > 0 else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
+_sparse_kda_router_loss_suffix = (f" rc={SPARSE_KDA_RECON_LOSS_WEIGHT}" if SPARSE_KDA_ROUTER_LOSS_TYPE == 'recon' and SPARSE_KDA_RECON_LOSS_WEIGHT > 0 else "") + (f" bal={SPARSE_KDA_BAL_LOSS_WEIGHT}" if SPARSE_KDA_ROUTER_LOSS_TYPE == 'bal' and SPARSE_KDA_BAL_LOSS_WEIGHT > 0 else "")
+_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} h={KDA_HEADS} d={KDA_DIM_HEAD}{"  +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""}{_sparse_kda_router_loss_suffix}{ f" dl={SPARSE_KDA_DISTILL_LOSS_WEIGHT}@{SPARSE_KDA_DISTILL_EVERY}" if SPARSE_KDA_DISTILL_LOSS_WEIGHT > 0 else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
 _kda_suffix = f' h={KDA_HEADS} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'kda' else ''
 RUN_NAME = f'[{_config_name}] {MEMORY_TYPE}{_sparse_kda_suffix}{_kda_suffix} lm={NUM_LONGTERM_MEM} ly={NEURAL_MEM_LAYERS} sq={SEQ_LEN} bs={BATCH_SIZE} ga={GRADIENT_ACCUMULATE_EVERY}'
 
@@ -119,6 +120,7 @@ elif MEMORY_TYPE == 'sparse_kda':
         dim_head = KDA_DIM_HEAD,
         use_shared_memory = SPARSE_KDA_USE_SHARED_MEMORY,
         router_hidden = SPARSE_KDA_ROUTER_HIDDEN,
+        router_loss_type = SPARSE_KDA_ROUTER_LOSS_TYPE,
     )
 elif USE_MEM_ATTENTION_MODEL:
     print("Using Memory Attention Model")
@@ -288,11 +290,18 @@ with profiler_context as prof:
                 from titans_pytorch.kda_memory import SparseKDAMemory
                 for _, module in model.named_modules():
                     if isinstance(module, SparseKDAMemory):
-                        recon = module.get_recon_loss()
-                        if recon is not None:
-                            loss = loss + SPARSE_KDA_RECON_LOSS_WEIGHT * recon
-                            total_recon_loss = recon if total_recon_loss is None else total_recon_loss + recon
-                        module.reset_recon_loss()
+                        if SPARSE_KDA_ROUTER_LOSS_TYPE == 'recon':
+                            recon = module.get_recon_loss()
+                            if recon is not None:
+                                loss = loss + SPARSE_KDA_RECON_LOSS_WEIGHT * recon
+                                total_recon_loss = recon if total_recon_loss is None else total_recon_loss + recon
+                            module.reset_recon_loss()
+                        else:  # 'bal'
+                            bal = module.get_bal_loss()
+                            if bal is not None:
+                                loss = loss + SPARSE_KDA_BAL_LOSS_WEIGHT * bal
+                                total_recon_loss = bal if total_recon_loss is None else total_recon_loss + bal
+                            module.reset_bal_loss()
                         distill = module.get_distill_loss()
                         if distill is not None:
                             loss = loss + SPARSE_KDA_DISTILL_LOSS_WEIGHT * distill
@@ -312,7 +321,7 @@ with profiler_context as prof:
             qps = _rate * BATCH_SIZE * GRADIENT_ACCUMULATE_EVERY * SEQ_LEN,
         )
         if MEMORY_TYPE == 'sparse_kda' and total_recon_loss is not None:
-            log_dict['recon_loss'] = total_recon_loss.item()
+            log_dict['bal_loss' if SPARSE_KDA_ROUTER_LOSS_TYPE == 'bal' else 'recon_loss'] = total_recon_loss.item()
         wandb.log(log_dict, step = i)
 
         if MEMORY_TYPE == 'sparse_kda' and i % SPARSE_KDA_LOG_HITRATE_EVERY == 0:
