@@ -895,6 +895,7 @@ class SparseKDAMemory(Module):
         allow_neg_eigval=False,
         norm_eps=1e-5,
         use_shared_memory=False,
+        router_hidden=None,
     ):
         super().__init__()
         dim_head = default(dim_head, dim // heads)
@@ -927,22 +928,26 @@ class SparseKDAMemory(Module):
         )
         self.slots = nn.ModuleList([KDASlot(**slot_kwargs) for _ in range(num_memory_slots)])
 
-        # Router: autoencoder-style
-        #   MLP_enc: key_dim -> router_hidden -> N  (expand then compress to slot logits)
-        #   MLP_dec: N -> router_hidden -> key_dim  (expand then reconstruct query emb)
-        # router_hidden > key_dim: expand first to relax input info before compressing to N slots.
-        # The N-dim logit space is the true bottleneck.
-        router_hidden = key_dim * 2
-        self.router_enc = nn.Sequential(
-            Linear(key_dim, router_hidden, bias=False),
-            nn.SiLU(),
-        )
-        self.router_fc = Linear(router_hidden, num_memory_slots, bias=False)
-        self.router_dec = nn.Sequential(
-            Linear(num_memory_slots, router_hidden, bias=False),
-            nn.SiLU(),
-            Linear(router_hidden, key_dim, bias=False),
-        )
+        # Router: linear or MLP autoencoder
+        #   router_enc + router_fc: key_dim -> [router_hidden ->] N  (slot logits)
+        #   router_dec: N -> [router_hidden ->] key_dim  (reconstruct query emb)
+        # router_hidden=None: single linear layer (default)
+        # router_hidden=int: MLP with one hidden layer of that width
+        if router_hidden is None:
+            self.router_enc = nn.Identity()
+            self.router_fc = Linear(key_dim, num_memory_slots, bias=False)
+            self.router_dec = Linear(num_memory_slots, key_dim, bias=False)
+        else:
+            self.router_enc = nn.Sequential(
+                Linear(key_dim, router_hidden, bias=False),
+                nn.SiLU(),
+            )
+            self.router_fc = Linear(router_hidden, num_memory_slots, bias=False)
+            self.router_dec = nn.Sequential(
+                Linear(num_memory_slots, router_hidden, bias=False),
+                nn.SiLU(),
+                Linear(router_hidden, key_dim, bias=False),
+            )
 
         # Optional shared (dense) slot: all tokens read/write, independent KDASlot
         self.shared_slot = KDASlot(**slot_kwargs) if use_shared_memory else None

@@ -10,7 +10,10 @@
 # ///
 
 import os
+import sys
 import random
+import argparse
+import importlib.util
 import tqdm
 import gzip
 import numpy as np
@@ -29,84 +32,34 @@ from titans_pytorch import (
     MemoryAttention
 )
 
-# constants
+# load config from --config argument (default: configs/default.py)
 
-NUM_BATCHES = int(1e5)
-BATCH_SIZE = 16
-GRADIENT_ACCUMULATE_EVERY = 4
-LEARNING_RATE = 2e-4
-VALIDATE_EVERY  = 100
-GENERATE_EVERY  = 500
-PRIME_LENGTH = 100
-GENERATE_LENGTH = 512
-SHOULD_GENERATE = True
-SEQ_LEN = 2048 # if SEQ_LEN is 512, KDA memory size has 8 x 128 entries which can cover all tokens already, even for 2048 seq len, the first 8 x 128 tokens won't benefit from KDA memory.
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument('--config', default='configs/default.py')
+_args, _ = _parser.parse_known_args()
 
-# neural memory related
+def _load_config(path):
+    _spec = importlib.util.spec_from_file_location('_config', os.path.abspath(path))
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    for k, v in vars(_mod).items():
+        if not k.startswith('_'):
+            globals()[k] = v
 
-# Choose memory type: 'neural' (TTT-based), 'kda' (linear attention), 'sparse_kda' (SM-KDA)
-MEMORY_TYPE = 'sparse_kda'  # Options: 'neural', 'kda', 'sparse_kda'
+_default_path = os.path.join(os.path.dirname(__file__), 'configs/default.py')
+_load_config(_default_path)
 
-NEURAL_MEMORY_DEPTH = 2
-NUM_PERSIST_MEM = 4
-NUM_LONGTERM_MEM = 4 # TODO: we can set NUM_LONGTERM_MEM to 0, so only the memory matrix can retain longterm information, and see if that helps the neural memory model learn better longterm retention strategies. This also allows us to test the neural memory's ability to learn to write to the memory matrix in a way that retains longterm information, without relying on the presence of persist mem tokens which are designed to be longterm.
-NEURAL_MEM_LAYERS = (2, 4, 6)                   # layers 2, 4, 6 have neural memory, can add more
-NEURAL_MEM_GATE_ATTN_OUTPUT = False
-NEURAL_MEM_MOMENTUM = True
-NEURAL_MEM_MOMENTUM_ORDER = 1
-NEURAL_MEM_QK_NORM = True
-NEURAL_MEM_MAX_LR = 1e-1
-USE_MEM_ATTENTION_MODEL = False
-WINDOW_SIZE = 32
-NEURAL_MEM_SEGMENT_LEN = 4                      # set smaller for more granularity for learning rate / momentum etc
-NEURAL_MEM_BATCH_SIZE = 128                     # set smaller to update the neural memory weights more often as it traverses the sequence
-SLIDING_WINDOWS = True
-STORE_ATTN_POOL_CHUNKS = True                   # whether to use attention pooling for chunk derived momentum, per-layer lr mod, decay
-MEMORY_MODEL_PER_LAYER_LEARNED_LR = True
-NEURAL_MEM_WEIGHT_RESIDUAL = True               # learning to accept contributions from the weights of the previous neural mem layer brings about significant improvements. this was improvised and not in the paper, but inspired by the value residual learning free lunch paper
-NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW = True        # will allow the neural memory to select what layers from which to derive queries / keys / values, effectively allowing it to graft itself to the transformer in any way to be beneficial. this is to address an issue from a phd student who noted that the mem network is learning nothing more than wk @ wv. this also generalizes all possible ways to connect the neural memory to a transformer, a sort of NAS
-NEURAL_MEM_SPEC_NORM_SURPRISES = True           # applying lessons from Muon optimizer to surprise updates, by spectral norming the surprises
+_config_path = os.path.abspath(_args.config)
+_config_name = os.path.splitext(os.path.basename(_config_path))[0]
+if os.path.abspath(_config_path) != os.path.abspath(_default_path):
+    _load_config(_config_path)
 
-# KDA memory specific settings (only used when MEMORY_TYPE = 'kda')
-KDA_CHUNK_SIZE = NEURAL_MEM_SEGMENT_LEN * 8     # Chunk size for KDA (larger chunks = more efficient)
-KDA_USE_CHUNK = True                            # Use chunked KDA (faster) vs recurrent (more flexible)
-KDA_HEADS = 8                                   # Number of attention heads (memory matrix size = heads * dim_head^2)
-KDA_DIM_HEAD = 128                               # Head dimension (default: dim // heads = 64)
-
-# Sparse KDA settings (only used when MEMORY_TYPE = 'sparse_kda')
-SPARSE_KDA_NUM_SLOTS = 8 # 8                        # N: total number of memory matrices
-SPARSE_KDA_TOP_K = 4 # 4                            # k: how many slots each token activates
-SPARSE_KDA_LOG_HITRATE_EVERY = 5                # how often to log slot hit rates to wandb
-SPARSE_KDA_RECON_LOSS_WEIGHT = 0.1              # weight for router reconstruction loss (autoencoder)
-SPARSE_KDA_USE_SHARED_MEMORY = False # True            # add a dense shared memory that all tokens read/write
-SPARSE_KDA_DISTILL_EVERY = 5                  # how often to run oracle debug + distillation loss (0 = disabled)
-SPARSE_KDA_DISTILL_LOSS_WEIGHT = 0.00          # weight for oracle distillation loss (0 = disabled)
-
-# experiment related
-
-PROJECT_NAME = 'titans-mac-transformer'
-_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} h={KDA_HEADS} d={KDA_DIM_HEAD}{"  +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""}{ f" rc={SPARSE_KDA_RECON_LOSS_WEIGHT}" if SPARSE_KDA_RECON_LOSS_WEIGHT > 0 else ""}{ f" dl={SPARSE_KDA_DISTILL_LOSS_WEIGHT}@{SPARSE_KDA_DISTILL_EVERY}" if SPARSE_KDA_DISTILL_LOSS_WEIGHT > 0 else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
-_kda_suffix = f' h={KDA_HEADS} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'kda' else ''
+# RUN_NAME: config file name prefix + auto-generated suffix from config constants
 # run name abbreviations: N=num_slots, k=top_k, h=heads, d=dim_head, +sh=shared_memory
 #   lm=num_longterm_mem, ly=neural_mem_layers, sq=seq_len, bs=batch_size, ga=gradient_accumulate_every
-RUN_NAME = f'mac-{MEMORY_TYPE}{_sparse_kda_suffix}{_kda_suffix} lm={NUM_LONGTERM_MEM} ly={NEURAL_MEM_LAYERS} sq={SEQ_LEN} bs={BATCH_SIZE} ga={GRADIENT_ACCUMULATE_EVERY}'
-WANDB_ONLINE = True # turn this on to pipe experiment to cloud
-
-# perf related
-
-USE_ACCELERATED_SCAN = False
-USE_FLEX_ATTN = True
-USE_FAST_INFERENCE = False
-USE_AMP = True                                     # mixed precision (bf16) for tensor core utilization
-
-# profiling related
-
-PROFILE_ENABLED = False                            # set to True to enable profiling
-PROFILE_OUTPUT_DIR = './profiler_logs'              # output directory for traces
-PROFILE_WAIT = 40                                  # steps to skip (let torch.compile finish warming up)
-PROFILE_WARMUP = 2                                 # steps to warm up profiler
-PROFILE_ACTIVE = 3                                 # steps to actively record
-PROFILE_REPEAT = 1                                 # number of profiling cycles (0 = repeat until end)
+_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K} h={KDA_HEADS} d={KDA_DIM_HEAD}{"  +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""}{ f" rc={SPARSE_KDA_RECON_LOSS_WEIGHT}" if SPARSE_KDA_RECON_LOSS_WEIGHT > 0 else ""}{ f" dl={SPARSE_KDA_DISTILL_LOSS_WEIGHT}@{SPARSE_KDA_DISTILL_EVERY}" if SPARSE_KDA_DISTILL_LOSS_WEIGHT > 0 else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
+_kda_suffix = f' h={KDA_HEADS} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'kda' else ''
+RUN_NAME = f'[{_config_name}] {MEMORY_TYPE}{_sparse_kda_suffix}{_kda_suffix} lm={NUM_LONGTERM_MEM} ly={NEURAL_MEM_LAYERS} sq={SEQ_LEN} bs={BATCH_SIZE} ga={GRADIENT_ACCUMULATE_EVERY}'
 
 # wandb experiment tracker
 
@@ -165,6 +118,7 @@ elif MEMORY_TYPE == 'sparse_kda':
         heads = KDA_HEADS,
         dim_head = KDA_DIM_HEAD,
         use_shared_memory = SPARSE_KDA_USE_SHARED_MEMORY,
+        router_hidden = SPARSE_KDA_ROUTER_HIDDEN,
     )
 elif USE_MEM_ATTENTION_MODEL:
     print("Using Memory Attention Model")
@@ -297,7 +251,7 @@ profiler_context = torch.profiler.profile(
 ) if PROFILE_ENABLED else nullcontext()
 
 with profiler_context as prof:
-    for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
+    for i in (pbar := tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training')):
         model.train()
 
         # Log oracle debug results from previous step's forward (if any)
@@ -345,7 +299,12 @@ with profiler_context as prof:
         optim.step()
         optim.zero_grad()
 
-        log_dict = dict(train_loss = task_loss.item())
+        _rate = pbar.format_dict.get('rate') or 0
+        log_dict = dict(
+            train_loss = task_loss.item(),
+            secs_per_iter = 1.0 / _rate if _rate > 0 else 0,
+            qps = _rate * BATCH_SIZE * GRADIENT_ACCUMULATE_EVERY * SEQ_LEN,
+        )
         if MEMORY_TYPE == 'sparse_kda' and total_recon_loss is not None:
             log_dict['recon_loss'] = total_recon_loss.item()
         wandb.log(log_dict, step = i)
