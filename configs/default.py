@@ -16,7 +16,7 @@ MEMORY_TYPE = 'kda'  # Options: 'neural', 'kda', 'sparse_kda'
 
 NEURAL_MEMORY_DEPTH = 2
 NUM_PERSIST_MEM = 4
-NUM_LONGTERM_MEM = 4
+NUM_LONGTERM_MEM = 0
 NEURAL_MEM_LAYERS = (2, 4, 6)                   # layers 2, 4, 6 have neural memory, can add more
 NEURAL_MEM_GATE_ATTN_OUTPUT = False
 NEURAL_MEM_MOMENTUM = True
@@ -54,7 +54,7 @@ SPARSE_KDA_ROUTER_HIDDEN = None                 # None = linear router; int = ML
 
 # experiment related
 
-PROJECT_NAME = 'titans-mac-transformer'
+PROJECT_NAME = 'sparse-kda-transformer'
 WANDB_ONLINE = True
 
 # perf related
