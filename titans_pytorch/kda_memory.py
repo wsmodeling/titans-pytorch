@@ -459,6 +459,40 @@ class KDAMemory(Module):
 
         self.register_buffer('zero', torch.tensor(0.), persistent=False)
 
+        # Delta rule residual norm (no grad, logging only)
+        self._residual_norm_enabled = False
+        self._residual_norm_sum = 0.0
+        self._residual_norm_count = 0
+
+        # Attention oracle residual: ||o_mem - o_attn|| at last token (no grad, logging only)
+        self._attn_residual_sum = 0.0
+        self._attn_residual_count = 0
+
+    def enable_residual_logging(self):
+        self._residual_norm_enabled = True
+
+    def disable_residual_logging(self):
+        self._residual_norm_enabled = False
+
+    def get_residual_norm(self):
+        if self._residual_norm_count == 0:
+            return None
+        return self._residual_norm_sum / self._residual_norm_count
+
+    def reset_residual_norm(self):
+        self._residual_norm_sum = 0.0
+        self._residual_norm_count = 0
+
+    def get_attn_residual(self):
+        """Mean ||o_mem - o_attn|| at last token over accumulated forward calls."""
+        if self._attn_residual_count == 0:
+            return None
+        return self._attn_residual_sum / self._attn_residual_count
+
+    def reset_attn_residual(self):
+        self._attn_residual_sum = 0.0
+        self._attn_residual_count = 0
+
     def forward(
         self,
         seq,
@@ -538,6 +572,7 @@ class KDAMemory(Module):
 
         # Output: FusedRMSNormGated(head_v_dim, activation='sigmoid')
         # = RMSNorm(o) * sigmoid(g_proj(x))
+        o_raw = o  # [B, T, H, D] pre-gate, used for attn oracle logging
         gate = rearrange(self.g_proj(normed), 'b t (h d) -> b t h d', h=self.heads).sigmoid()
         o = self.o_norm(o) * gate
 
@@ -549,6 +584,27 @@ class KDAMemory(Module):
             new_state = KDAState(seq_index + seq_len, new_hidden_state)
         else:
             new_state = None
+
+        if self._residual_norm_enabled and new_hidden_state is not None:
+            with torch.no_grad():
+                # |v - k@S| at the last token using final hidden state
+                k_last = k[:, -1]   # [B, H, D]
+                v_last = v[:, -1]   # [B, H, D]
+                kS_last = torch.einsum('b h d, b h d v -> b h v', k_last, new_hidden_state)
+                self._residual_norm_sum += (v_last - kS_last).abs().mean().item()
+                self._residual_norm_count += 1
+
+                # Attention oracle residual: ||o_mem_last - o_attn_last||
+                # o_mem_last: raw memory read-out at last token [B, H, D]
+                # o_attn_last: causal softmax attention output at last token [B, H, D]
+                o_mem_last = o_raw[:, -1].float()  # [B, H, D]
+                q_bhtd = q.float().permute(0, 2, 1, 3)   # [B, H, T, D]
+                k_bhtd = k.float().permute(0, 2, 1, 3)
+                v_bhtd = v.float().permute(0, 2, 1, 3)
+                o_attn = F.scaled_dot_product_attention(q_bhtd, k_bhtd, v_bhtd, is_causal=True)
+                o_attn_last = o_attn[:, :, -1, :]         # [B, H, D]
+                self._attn_residual_sum += (o_mem_last - o_attn_last).abs().mean().item()
+                self._attn_residual_count += 1
 
         return o, new_state
 
@@ -984,6 +1040,10 @@ class SparseKDAMemory(Module):
         self._residual_norm_sum = 0.0
         self._residual_norm_count = 0
 
+        # Attention oracle residual: ||o_mem - o_attn|| at last token (no grad, logging only)
+        self._attn_residual_sum = 0.0
+        self._attn_residual_count = 0
+
         # Oracle distillation loss accumulator
         self._distill_loss_accum = None
         self._distill_loss_count = 0
@@ -1100,6 +1160,16 @@ class SparseKDAMemory(Module):
     def reset_residual_norm(self):
         self._residual_norm_sum = 0.0
         self._residual_norm_count = 0
+
+    def get_attn_residual(self):
+        """Mean ||o_mem - o_attn|| at last token over accumulated forward calls."""
+        if self._attn_residual_count == 0:
+            return None
+        return self._attn_residual_sum / self._attn_residual_count
+
+    def reset_attn_residual(self):
+        self._attn_residual_sum = 0.0
+        self._attn_residual_count = 0
 
     def get_slot_hit_rates(self):
         """Fraction of tokens that selected each slot via top-k (normalized, sums to 1)."""
@@ -1288,6 +1358,7 @@ class SparseKDAMemory(Module):
         else:
             new_shared_hidden_state = None
 
+        o_raw = o  # [B, T, H, D] pre-gate, used for attn oracle logging
         gate = rearrange(self.g_proj(normed), 'b t (h d) -> b t h d', h=self.heads).sigmoid()
         o = self.o_norm(o) * gate
 
@@ -1298,6 +1369,22 @@ class SparseKDAMemory(Module):
             new_state = SparseKDAState(seq_index + seq_len, new_hidden_state, new_shared_hidden_state)
         else:
             new_state = None
+
+        if self._residual_log is not None:
+            # Attention oracle residual: ||o_mem_last - o_attn_last||
+            # k/v: [N,B,T,H,D], router_weights: [B,T,N] -> k_mixed/v_mixed: [B,T,H,D]
+            with torch.no_grad():
+                w = router_weights.float()                                              # [B, T, N]
+                k_mixed = torch.einsum('btn,nbthd->bthd', w, k.float())               # [B, T, H, D]
+                v_mixed = torch.einsum('btn,nbthd->bthd', w, v.float())
+                q_bhtd = q.float().permute(0, 2, 1, 3)                                # [B, H, T, D]
+                k_bhtd = k_mixed.permute(0, 2, 1, 3)
+                v_bhtd = v_mixed.permute(0, 2, 1, 3)
+                o_attn = F.scaled_dot_product_attention(q_bhtd, k_bhtd, v_bhtd, is_causal=True)
+                o_attn_last = o_attn[:, :, -1, :]                                     # [B, H, D]
+                o_mem_last = o_raw[:, -1].float()                                      # [B, H, D]
+                self._attn_residual_sum += (o_mem_last - o_attn_last).abs().mean().item()
+                self._attn_residual_count += 1
 
         return o, new_state
 

@@ -172,10 +172,10 @@ if USE_AMP:
 
 model = torch.compile(model)
 
-if MEMORY_TYPE == 'sparse_kda':
-    from titans_pytorch.kda_memory import SparseKDAMemory
+if MEMORY_TYPE in ('sparse_kda', 'kda'):
+    from titans_pytorch.kda_memory import SparseKDAMemory, KDAMemory
     for _, module in model.named_modules():
-        if isinstance(module, SparseKDAMemory):
+        if isinstance(module, (SparseKDAMemory, KDAMemory)):
             module.enable_residual_logging()
 
 # prepare enwik8 data
@@ -324,15 +324,15 @@ with profiler_context as prof:
             log_dict['bal_loss' if SPARSE_KDA_ROUTER_LOSS_TYPE == 'bal' else 'recon_loss'] = total_recon_loss.item()
         wandb.log(log_dict, step = i)
 
-        if MEMORY_TYPE == 'sparse_kda' and i % SPARSE_KDA_LOG_HITRATE_EVERY == 0:
-            from titans_pytorch.kda_memory import SparseKDAMemory
+        if MEMORY_TYPE in ('sparse_kda', 'kda') and i % SPARSE_KDA_LOG_HITRATE_EVERY == 0:
+            from titans_pytorch.kda_memory import SparseKDAMemory, KDAMemory
             log_dict = {}
             for name, module in model.named_modules():
+                short_name = name.replace('_orig_mod.', '').replace('.4', '')
                 if isinstance(module, SparseKDAMemory):
                     rates = module.get_slot_hit_rates()
                     avg_weights = module.get_slot_avg_weights()
                     logit_mean, logit_std = module.get_slot_logit_stats()
-                    short_name = name.replace('_orig_mod.', '').replace('.4', '')
                     rates_str   = ' '.join(f'{r:.3f}'  for r in rates.tolist())
                     weights_str = ' '.join(f'{w:.4f}'  for w in avg_weights.tolist())
                     mean_str    = ' '.join(f'{m:.4f}'  for m in logit_mean.tolist())
@@ -347,13 +347,22 @@ with profiler_context as prof:
                         log_dict[f'slot_logit_mean/{short_name}/slot_{slot_idx}'] = logit_mean[slot_idx].item()
                         log_dict[f'slot_logit_std/{short_name}/slot_{slot_idx}']  = logit_std[slot_idx].item()
                     module.reset_slot_stats()
-                    # residual_norm: mean |v - kS| from the last token of the last chunk per forward call.
+                if isinstance(module, (SparseKDAMemory, KDAMemory)):
+                    # residual_norm: mean |v - kS| from the last token per forward call.
                     # Lower = memory has better recall for the keys it sees. Reflects learning trend.
                     residual_norm = module.get_residual_norm()
                     if residual_norm is not None:
                         log_dict[f'residual_norm/{short_name}'] = residual_norm
                         tqdm.tqdm.write(f'[{short_name}] residual_norm: {residual_norm:.4f}')
                     module.reset_residual_norm()
+                    # attn_residual: ||o_mem - o_attn|| at last token.
+                    # o_mem = q@S (memory read-out), o_attn = causal softmax attention.
+                    # Lower = memory better approximates ideal attention.
+                    attn_residual = module.get_attn_residual()
+                    if attn_residual is not None:
+                        log_dict[f'attn_residual/{short_name}'] = attn_residual
+                        tqdm.tqdm.write(f'[{short_name}] attn_residual: {attn_residual:.4f}')
+                    module.reset_attn_residual()
             if log_dict:
                 wandb.log(log_dict, step = i)
 
