@@ -957,6 +957,7 @@ class SparseKDAMemory(Module):
         use_shared_memory=False,
         router_hidden=None,
         router_loss_type='recon',
+        router_use_normalized_q: bool = True,
     ):
         super().__init__()
         dim_head = default(dim_head, dim // heads)
@@ -968,6 +969,10 @@ class SparseKDAMemory(Module):
         self.use_short_conv = use_short_conv
         self.allow_neg_eigval = allow_neg_eigval
         self.use_shared_memory = use_shared_memory
+    # Whether to pass the per-head L2-normalized flattened query to the router
+    # (recommended: True). If False, the router receives the raw flattened
+    # projection output (pre-normalization), preserving legacy behavior.
+    self.router_use_normalized_q = router_use_normalized_q
         assert router_loss_type in ('recon', 'bal'), f"router_loss_type must be 'recon' or 'bal', got {router_loss_type!r}"
         self.router_loss_type = router_loss_type
 
@@ -1296,6 +1301,9 @@ class SparseKDAMemory(Module):
             q_flat = self.q_conv1d(self.q_proj(normed))  # [B, T, H*D]
         else:
             q_flat = F.silu(self.q_proj(normed))          # [B, T, H*D]
+        # Per-head query tensor (normalized per-head). We'll also provide the
+        # router with the flattened, per-head-normalized embedding so routing
+        # decisions use the same normalized representation as the memory read.
         q = rearrange(q_flat, 'b t (h d) -> b t h d', h=self.heads)
         q = F.normalize(q, dim=-1)
 
@@ -1308,15 +1316,20 @@ class SparseKDAMemory(Module):
         beta = torch.stack([o[3] for o in slot_outputs], dim=0)   # [N, B, T, H]
 
         # Sparse routing weights [B, T, N] and top-k indices [B, T, k]
-        # q_flat: [B, T, H*D] — the actual query emb used by all slots
-        router_weights, topk_indices = self._route(q_flat)
+        # Use either the flattened per-head-normalized query or the raw
+        # flattened projection depending on configuration. Passing the
+        # normalized representation often yields more stable routing.
+        q_flat_norm = rearrange(q, 'b t h d -> b t (h d)')
+        router_input = q_flat_norm if self.router_use_normalized_q else q_flat
+        router_weights, topk_indices = self._route(router_input)
 
         if debug_oracle:
             slot_dist = self._run_oracle_debug(q, k, v, topk_indices, hidden_state)
             # slot_dist: [N, B, T], no_grad — use as soft labels for router
             # soft_label[b,t,i] ∝ exp(-dist[i,b,t] / T), lower dist → higher label
             # router_logits: [B, T, N], has grad
-            router_logits = self.router_fc(self.router_enc(q_flat))  # [B, T, N], recompute with grad
+            # recompute router logits using the same router input
+            router_logits = self.router_fc(self.router_enc(router_input))  # [B, T, N], recompute with grad
             slot_dist_bt = slot_dist.permute(1, 2, 0)          # [B, T, N]
             soft_labels = (-slot_dist_bt / self.oracle_distill_temperature).softmax(dim=-1).detach()
             distill_loss = F.kl_div(
@@ -1396,6 +1409,7 @@ def create_sparse_kda_memory_for_mac(
     top_k=2,
     use_short_conv=True,
     use_shared_memory=False,
+    router_use_normalized_q: bool = True,
     **kwargs
 ):
     """
@@ -1415,5 +1429,6 @@ def create_sparse_kda_memory_for_mac(
         top_k=top_k,
         use_short_conv=use_short_conv,
         use_shared_memory=use_shared_memory,
+        router_use_normalized_q=router_use_normalized_q,
         **kwargs
     )

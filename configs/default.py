@@ -51,6 +51,7 @@ SPARSE_KDA_USE_SHARED_MEMORY = False            # add a dense shared memory that
 SPARSE_KDA_DISTILL_EVERY = 5                    # how often to run oracle debug + distillation loss (0 = disabled)
 SPARSE_KDA_DISTILL_LOSS_WEIGHT = 0.00           # weight for oracle distillation loss (0 = disabled)
 SPARSE_KDA_ROUTER_HIDDEN = None                 # None = linear router; int = MLP hidden width (e.g. key_dim*2)
+SPARSE_KDA_ROUTER_USE_NORMALIZED_Q = False       # whether to feed per-head-normalized q to router (recommended)
 
 # experiment related
 

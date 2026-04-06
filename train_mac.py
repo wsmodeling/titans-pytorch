@@ -121,6 +121,7 @@ elif MEMORY_TYPE == 'sparse_kda':
         use_shared_memory = SPARSE_KDA_USE_SHARED_MEMORY,
         router_hidden = SPARSE_KDA_ROUTER_HIDDEN,
         router_loss_type = SPARSE_KDA_ROUTER_LOSS_TYPE,
+        router_use_normalized_q = SPARSE_KDA_ROUTER_USE_NORMALIZED_Q,
     )
 elif USE_MEM_ATTENTION_MODEL:
     print("Using Memory Attention Model")
