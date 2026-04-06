@@ -58,7 +58,7 @@ if os.path.abspath(_config_path) != os.path.abspath(_default_path):
 # run name abbreviations: N=num_slots, k=top_k, h=heads, d=dim_head, +sh=shared_memory
 #   lm=num_longterm_mem, ly=neural_mem_layers, sq=seq_len, bs=batch_size, ga=gradient_accumulate_every
 _sparse_kda_router_loss_suffix = (f" rc={SPARSE_KDA_RECON_LOSS_WEIGHT}" if SPARSE_KDA_ROUTER_LOSS_TYPE == 'recon' and SPARSE_KDA_RECON_LOSS_WEIGHT > 0 else "") + (f" bal={SPARSE_KDA_BAL_LOSS_WEIGHT}" if SPARSE_KDA_ROUTER_LOSS_TYPE == 'bal' and SPARSE_KDA_BAL_LOSS_WEIGHT > 0 else "")
-_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K}{" +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""} h={KDA_HEADS} d={KDA_DIM_HEAD}{_sparse_kda_router_loss_suffix}{ f" dl={SPARSE_KDA_DISTILL_LOSS_WEIGHT}@{SPARSE_KDA_DISTILL_EVERY}" if SPARSE_KDA_DISTILL_LOSS_WEIGHT > 0 else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
+_sparse_kda_suffix = f' N={SPARSE_KDA_NUM_SLOTS} k={SPARSE_KDA_TOP_K}{" +sh" if SPARSE_KDA_USE_SHARED_MEMORY else ""} h={KDA_HEADS} d={KDA_DIM_HEAD}{_sparse_kda_router_loss_suffix}{ f" dl={SPARSE_KDA_DISTILL_LOSS_WEIGHT}@{SPARSE_KDA_DISTILL_EVERY}" if SPARSE_KDA_DISTILL_LOSS_WEIGHT > 0 else ""}{" +norm_q" if SPARSE_KDA_ROUTER_USE_NORMALIZED_Q else ""}' if MEMORY_TYPE == 'sparse_kda' else ''
 _kda_suffix = f' h={KDA_HEADS} d={KDA_DIM_HEAD}' if MEMORY_TYPE == 'kda' else ''
 RUN_NAME = f'[{_config_name}] {MEMORY_TYPE}{_sparse_kda_suffix}{_kda_suffix} ly={NEURAL_MEM_LAYERS} sq={SEQ_LEN} bs={BATCH_SIZE} ga={GRADIENT_ACCUMULATE_EVERY}'
 
