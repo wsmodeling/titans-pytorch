@@ -969,10 +969,7 @@ class SparseKDAMemory(Module):
         self.use_short_conv = use_short_conv
         self.allow_neg_eigval = allow_neg_eigval
         self.use_shared_memory = use_shared_memory
-    # Whether to pass the per-head L2-normalized flattened query to the router
-    # (recommended: True). If False, the router receives the raw flattened
-    # projection output (pre-normalization), preserving legacy behavior.
-    self.router_use_normalized_q = router_use_normalized_q
+        self.router_use_normalized_q = router_use_normalized_q
         assert router_loss_type in ('recon', 'bal'), f"router_loss_type must be 'recon' or 'bal', got {router_loss_type!r}"
         self.router_loss_type = router_loss_type
 
