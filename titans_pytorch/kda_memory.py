@@ -1304,55 +1304,63 @@ class SparseKDAMemory(Module):
         q = rearrange(q_flat, 'b t (h d) -> b t h d', h=self.heads)
         q = F.normalize(q, dim=-1)
 
-        # K, V, g, beta: each sparse slot computes its own via KDASlot
-        # Stack results: k/v/g [N, B, T, H, D], beta [N, B, T, H]
-        slot_outputs = [slot(normed) for slot in self.slots]
-        k    = torch.stack([o[0] for o in slot_outputs], dim=0)   # [N, B, T, H, D]
-        v    = torch.stack([o[1] for o in slot_outputs], dim=0)
-        g    = torch.stack([o[2] for o in slot_outputs], dim=0)
-        beta = torch.stack([o[3] for o in slot_outputs], dim=0)   # [N, B, T, H]
+        if self.top_k == 0:
+            # No sparse slots active — skip routing and recurrence entirely.
+            # Output is zeros; hidden state passes through unchanged.
+            B, T = batch, seq_len
+            o = torch.zeros(B, T, self.heads, self.dim_head, device=seq.device, dtype=seq.dtype)
+            new_hidden_state = hidden_state
+            k = v = router_weights = None  # used only in oracle block below
+        else:
+            # K, V, g, beta: each sparse slot computes its own via KDASlot
+            # Stack results: k/v/g [N, B, T, H, D], beta [N, B, T, H]
+            slot_outputs = [slot(normed) for slot in self.slots]
+            k    = torch.stack([o[0] for o in slot_outputs], dim=0)   # [N, B, T, H, D]
+            v    = torch.stack([o[1] for o in slot_outputs], dim=0)
+            g    = torch.stack([o[2] for o in slot_outputs], dim=0)
+            beta = torch.stack([o[3] for o in slot_outputs], dim=0)   # [N, B, T, H]
 
-        # Sparse routing weights [B, T, N] and top-k indices [B, T, k]
-        # Use either the flattened per-head-normalized query or the raw
-        # flattened projection depending on configuration. Passing the
-        # normalized representation often yields more stable routing.
-        q_flat_norm = rearrange(q, 'b t h d -> b t (h d)')
-        router_input = q_flat_norm if self.router_use_normalized_q else q_flat
-        router_weights, topk_indices = self._route(router_input)
+            # Sparse routing weights [B, T, N] and top-k indices [B, T, k]
+            # Use either the flattened per-head-normalized query or the raw
+            # flattened projection depending on configuration. Passing the
+            # normalized representation often yields more stable routing.
+            q_flat_norm = rearrange(q, 'b t h d -> b t (h d)')
+            router_input = q_flat_norm if self.router_use_normalized_q else q_flat
+            router_weights, topk_indices = self._route(router_input)
 
-        if debug_oracle:
-            slot_dist = self._run_oracle_debug(q, k, v, topk_indices, hidden_state)
-            # slot_dist: [N, B, T], no_grad — use as soft labels for router
-            # soft_label[b,t,i] ∝ exp(-dist[i,b,t] / T), lower dist → higher label
-            # router_logits: [B, T, N], has grad
-            # recompute router logits using the same router input
-            router_logits = self.router_fc(self.router_enc(router_input))  # [B, T, N], recompute with grad
-            slot_dist_bt = slot_dist.permute(1, 2, 0)          # [B, T, N]
-            soft_labels = (-slot_dist_bt / self.oracle_distill_temperature).softmax(dim=-1).detach()
-            distill_loss = F.kl_div(
-                router_logits.log_softmax(dim=-1),
-                soft_labels,
-                reduction='batchmean',
+            if debug_oracle:
+                slot_dist = self._run_oracle_debug(q, k, v, topk_indices, hidden_state)
+                # slot_dist: [N, B, T], no_grad — use as soft labels for router
+                # soft_label[b,t,i] ∝ exp(-dist[i,b,t] / T), lower dist → higher label
+                # router_logits: [B, T, N], has grad
+                # recompute router logits using the same router input
+                router_logits = self.router_fc(self.router_enc(router_input))  # [B, T, N], recompute with grad
+                slot_dist_bt = slot_dist.permute(1, 2, 0)          # [B, T, N]
+                soft_labels = (-slot_dist_bt / self.oracle_distill_temperature).softmax(dim=-1).detach()
+                distill_loss = F.kl_div(
+                    router_logits.log_softmax(dim=-1),
+                    soft_labels,
+                    reduction='batchmean',
+                )
+                if self._distill_loss_accum is None:
+                    self._distill_loss_accum = distill_loss
+                else:
+                    self._distill_loss_accum = self._distill_loss_accum + distill_loss
+                self._distill_loss_count += 1
+
+            o, new_hidden_state = naive_recurrent_sparse_kda_checkpointed(
+                q=q, k=k, v=v, g=g, beta=beta,
+                router_weights=router_weights,
+                topk_indices=topk_indices,
+                initial_state=hidden_state,
+                output_final_state=return_state,
+                chunk_size=32,
+                write_scale=1.0,
+                residual_log=self._residual_log,
             )
-            if self._distill_loss_accum is None:
-                self._distill_loss_accum = distill_loss
-            else:
-                self._distill_loss_accum = self._distill_loss_accum + distill_loss
-            self._distill_loss_count += 1
-
-        o, new_hidden_state = naive_recurrent_sparse_kda_checkpointed(
-            q=q, k=k, v=v, g=g, beta=beta,
-            router_weights=router_weights,
-            topk_indices=topk_indices,
-            initial_state=hidden_state,
-            output_final_state=return_state,
-            chunk_size=32,
-            write_scale=1.0,
-            residual_log=self._residual_log,
-        )
-        if self._residual_log is not None and self._residual_log:
-            self._residual_norm_sum += self._residual_log[0]
-            self._residual_norm_count += 1
+            if self._residual_log is not None and self._residual_log:
+                self._residual_norm_sum += self._residual_log[0]
+                self._residual_norm_count += 1
 
         # Shared (dense) slot: all tokens read/write, q reused from above
         # Add shared output before o_norm, matching MoM: o_norm(sparse_o + shared_o) * gate
@@ -1380,7 +1388,7 @@ class SparseKDAMemory(Module):
         else:
             new_state = None
 
-        if self._residual_log is not None:
+        if self._residual_log is not None and self.top_k > 0:
             # Attention oracle residual: ||o_mem_last - o_attn_last||
             # k/v: [N,B,T,H,D], router_weights: [B,T,N] -> k_mixed/v_mixed: [B,T,H,D]
             with torch.no_grad():
