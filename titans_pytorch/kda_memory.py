@@ -970,6 +970,7 @@ class SparseKDAMemory(Module):
         self.allow_neg_eigval = allow_neg_eigval
         self.use_shared_memory = use_shared_memory
         self.router_use_normalized_q = router_use_normalized_q
+        self.router_hidden = router_hidden
         assert router_loss_type in ('recon', 'bal'), f"router_loss_type must be 'recon' or 'bal', got {router_loss_type!r}"
         self.router_loss_type = router_loss_type
 
