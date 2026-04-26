@@ -958,6 +958,7 @@ class SparseKDAMemory(Module):
         router_hidden=None,
         router_loss_type='recon',
         router_use_normalized_q: bool = True,
+        use_oracle_router: bool = False,
     ):
         super().__init__()
         dim_head = default(dim_head, dim // heads)
@@ -973,6 +974,7 @@ class SparseKDAMemory(Module):
         self.router_hidden = router_hidden
         assert router_loss_type in ('recon', 'bal'), f"router_loss_type must be 'recon' or 'bal', got {router_loss_type!r}"
         self.router_loss_type = router_loss_type
+        self.use_oracle_router = use_oracle_router
 
         head_k_dim = dim_head
         head_v_dim = dim_head
@@ -1194,6 +1196,62 @@ class SparseKDAMemory(Module):
         return mean, std
 
     @torch.no_grad()
+    def _route_oracle(self, q, k, v, hidden_state):
+        """
+        Oracle routing: select top-k slots per token based on how well each slot's
+        current memory state approximates its causal attention oracle.
+
+        For each slot i and token t:
+            oracle_i[t] = causal softmax-attn(q, k_i, v_i)[t]   [B, H, V]
+            mem_i[t]    = q[t] @ S_i                              [B, H, V]
+            dist_i[t]   = ||mem_i[t] - oracle_i[t]||^2 (mean over H, V)
+
+        Select top_k slots with lowest dist_i per token.
+
+        Args:
+            q:            [B, T, H, D]
+            k:            [N, B, T, H, D]
+            v:            [N, B, T, H, D]
+            hidden_state: [B, N, H, D, V] or None
+        Returns:
+            router_weights: [B, T, N]  — uniform 1/top_k for selected slots, 0 elsewhere
+            topk_idx:       [B, T, top_k]
+        """
+        N, B, T, H, D = k.shape
+        V = v.shape[-1]
+
+        q_bhtd = q.float().permute(0, 2, 1, 3)  # [B, H, T, D]
+        causal_mask = torch.full((T, T), float('-inf'), device=q.device).triu(1)
+
+        # Causal attention oracle for each slot
+        oracle_os = []
+        for i in range(N):
+            k_i = k[i].float().permute(0, 2, 1, 3)  # [B, H, T, D]
+            v_i = v[i].float().permute(0, 2, 1, 3)  # [B, H, T, V]
+            o_i = F.scaled_dot_product_attention(q_bhtd, k_i, v_i, attn_mask=causal_mask)
+            oracle_os.append(o_i.permute(0, 2, 1, 3))  # [B, T, H, V]
+        oracle_os = torch.stack(oracle_os, dim=0)  # [N, B, T, H, V]
+
+        # Memory readout for each slot using current hidden state
+        S = hidden_state.float() if hidden_state is not None else \
+            torch.zeros(B, N, H, D, V, device=q.device, dtype=torch.float)
+        # q: [B, T, H, D], S: [B, N, H, D, V] -> mem: [N, B, T, H, V]
+        mem_os = torch.einsum('b t h d, b n h d v -> n b t h v', q.float(), S)
+
+        # dist[n, b, t] = mean squared diff over (H, V)
+        slot_dist = (mem_os - oracle_os).pow(2).mean(dim=(-1, -2))  # [N, B, T]
+
+        # Top-k slots with lowest dist per (b, t)
+        slot_dist_bt = slot_dist.permute(1, 2, 0)  # [B, T, N]
+        _, topk_idx = slot_dist_bt.topk(self.top_k, dim=-1, largest=False)  # [B, T, top_k]
+
+        # Uniform weights over selected slots
+        weights = torch.zeros(B, T, N, device=q.device, dtype=q.dtype)
+        weights.scatter_(-1, topk_idx, 1.0 / self.top_k)
+
+        return weights, topk_idx
+
+    @torch.no_grad()
     def _run_oracle_debug(self, q, k, v, topk_indices, hidden_state):
         """
         Oracle debug: compare each slot's memory output vs its causal attention oracle.
@@ -1322,12 +1380,14 @@ class SparseKDAMemory(Module):
             beta = torch.stack([o[3] for o in slot_outputs], dim=0)   # [N, B, T, H]
 
             # Sparse routing weights [B, T, N] and top-k indices [B, T, k]
-            # Use either the flattened per-head-normalized query or the raw
-            # flattened projection depending on configuration. Passing the
-            # normalized representation often yields more stable routing.
-            q_flat_norm = rearrange(q, 'b t h d -> b t (h d)')
-            router_input = q_flat_norm if self.router_use_normalized_q else q_flat
-            router_weights, topk_indices = self._route(router_input)
+            if self.use_oracle_router:
+                # Oracle routing: select slots by lowest dist(mem_readout, causal_attn_oracle)
+                router_weights, topk_indices = self._route_oracle(q, k, v, hidden_state)
+            else:
+                # Learned router
+                q_flat_norm = rearrange(q, 'b t h d -> b t (h d)')
+                router_input = q_flat_norm if self.router_use_normalized_q else q_flat
+                router_weights, topk_indices = self._route(router_input)
 
             if debug_oracle:
                 slot_dist = self._run_oracle_debug(q, k, v, topk_indices, hidden_state)
@@ -1416,6 +1476,7 @@ def create_sparse_kda_memory_for_mac(
     use_short_conv=True,
     use_shared_memory=False,
     router_use_normalized_q: bool = True,
+    use_oracle_router: bool = False,
     **kwargs
 ):
     """
@@ -1427,6 +1488,8 @@ def create_sparse_kda_memory_for_mac(
         num_memory_slots: N — total memory slots
         top_k: k — slots activated per token
         use_short_conv: causal conv on Q/K/V
+        use_oracle_router: if True, bypass learned router and select slots by
+            lowest distance between memory readout and causal attention oracle
     """
     return SparseKDAMemory(
         dim=dim,
@@ -1436,5 +1499,6 @@ def create_sparse_kda_memory_for_mac(
         use_short_conv=use_short_conv,
         use_shared_memory=use_shared_memory,
         router_use_normalized_q=router_use_normalized_q,
+        use_oracle_router=use_oracle_router,
         **kwargs
     )

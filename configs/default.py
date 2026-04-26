@@ -52,6 +52,7 @@ SPARSE_KDA_DISTILL_EVERY = 5                    # how often to run oracle debug 
 SPARSE_KDA_DISTILL_LOSS_WEIGHT = 0.00           # weight for oracle distillation loss (0 = disabled)
 SPARSE_KDA_ROUTER_HIDDEN = None                 # None = linear router; int = MLP hidden width (e.g. key_dim*2)
 SPARSE_KDA_ROUTER_USE_NORMALIZED_Q = False       # whether to feed per-head-normalized q to router (recommended)
+SPARSE_KDA_USE_ORACLE_ROUTER = False             # debug: bypass learned router, select slots by mem-oracle dist
 
 # experiment related
 
