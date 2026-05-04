@@ -27,7 +27,8 @@
       "Bash(export UV_DATA_DIR=\"/workspace/wshao/uv_cache/data\")",
       "Bash(timeout 60 /workspace/wshao/uv_cache/environments-v2/train-mac-c8f2eaff8d15c321/bin/python -c \":*)",
       "Bash(uv run python -c ' *)",
-      "Bash(/workspace/wshao/uv_cache/environments-v2/train-mac-c8f2eaff8d15c321/bin/python -c ' *)"
+      "Bash(/workspace/wshao/uv_cache/environments-v2/train-mac-c8f2eaff8d15c321/bin/python -c ' *)",
+      "Bash(/workspace/wshao/uv_cache/python/cpython-3.12.9-linux-x86_64-gnu/bin/python -c ' *)"
     ],
     "additionalDirectories": [
       "/tmp"

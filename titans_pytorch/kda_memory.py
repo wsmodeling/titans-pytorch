@@ -747,23 +747,27 @@ def naive_recurrent_sparse_kda(
 # ---------------------------------------------------------------------------
 
 @torch.compiler.disable
-def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S_in, topk_indices, write_scale=1.0, residual_log=None):
+def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S_in, topk_indices, write_indices, write_scale=1.0, residual_log=None):
     """
     Process one chunk of the sparse KDA recurrence (for gradient checkpointing).
 
-    Each slot only decays and updates when it is selected (top-k). Unselected slots
+    Write routing and read routing are decoupled:
+      - write_indices: [B, T_c, 1]  — LSH hash slot (hard assignment, top-1 write)
+      - topk_indices:  [B, T_c, k]  — oracle/learned read slots (top-k read)
+
+    Each slot only decays and updates when it is selected for write. Unselected slots
     are frozen — their state is preserved exactly until the next time they are activated.
-    This prevents unselected slots from decaying to zero over long sequences.
 
     Args:
-        q_chunk:    [B, T_c, H, D]
-        k_chunk:    [N, B, T_c, H, D]  — per-slot keys
-        v_chunk:    [N, B, T_c, H, D]  — per-slot values
-        g_chunk:    [N, B, T_c, H, D]  — per-slot gates
-        beta_chunk: [N, B, T_c, H]     — per-slot betas
-        r_chunk:    [B, T_c, N]        — routing weights
-        S_in:       [B, N, H, D, D]    — recurrent state
-        topk_indices: [B, T_c, k]
+        q_chunk:       [B, T_c, H, D]
+        k_chunk:       [N, B, T_c, H, D]  — per-slot keys
+        v_chunk:       [N, B, T_c, H, D]  — per-slot values
+        g_chunk:       [N, B, T_c, H, D]  — per-slot gates
+        beta_chunk:    [N, B, T_c, H]     — per-slot betas
+        r_chunk:       [B, T_c, N]        — read routing weights (for output blend)
+        S_in:          [B, N, H, D, D]    — recurrent state
+        topk_indices:  [B, T_c, k]        — read slot indices
+        write_indices: [B, T_c, 1]        — write slot index (LSH, one per token)
     """
     dtype = v_chunk.dtype
     T_c = q_chunk.shape[1]
@@ -774,70 +778,63 @@ def _sparse_kda_chunk(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk, S
     q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk = map(
         lambda x: x.to(torch.float), [q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, r_chunk]
     )
-    topk_indices = topk_indices.long()  # [B, T_c, k]
+    topk_indices  = topk_indices.long()   # [B, T_c, k]
+    write_indices = write_indices.long()  # [B, T_c, 1]
 
     S = S_in.to(torch.float)
     o_chunk = torch.zeros(B, T_c, H, V, dtype=torch.float, device=q_chunk.device)
 
     for i in range(T_c):
-        q_i       = q_chunk[:, i]           # [B, H, K]
-        r_i       = r_chunk[:, i]           # [B, N]
-        topk_idx_i = topk_indices[:, i]     # [B, k]
-        top_k = topk_idx_i.shape[1]
+        q_i         = q_chunk[:, i]         # [B, H, K]
+        r_i         = r_chunk[:, i]         # [B, N]
+        read_idx_i  = topk_indices[:, i]    # [B, k]
+        write_idx_i = write_indices[:, i]   # [B, 1]
 
-        # idx: [B, k, H, K, V] — expanded indices for gather/scatter on S
-        idx = topk_idx_i[:, :, None, None, None].expand(-1, -1, H, K, V)
+        # ---- WRITE: decay + delta rule for the single LSH-assigned slot ----
+        w_idx = write_idx_i[:, :, None, None, None].expand(-1, -1, H, K, V)  # [B, 1, H, K, V]
+        S_write = S.gather(1, w_idx)  # [B, 1, H, K, V]
 
-        # Gather top-k slots from recurrent state
-        S_topk = S.gather(1, idx)           # [B, k, H, K, V]
-
-        # Per-slot k/v/g/beta for the selected top-k slots only
-        # k_chunk[n] = [B, T_c, H, D], gather along slot dim
-        # topk_idx_i: [B, k] — need to index k_chunk along N dim per batch
-        # Rearrange: k_chunk[:, :, i] -> [N, B, H, D], then gather top-k
         k_all_i    = k_chunk[:, :, i]       # [N, B, H, D]
         v_all_i    = v_chunk[:, :, i]       # [N, B, H, D]
         g_all_i    = g_chunk[:, :, i]       # [N, B, H, D]
         beta_all_i = beta_chunk[:, :, i]    # [N, B, H]
 
-        # Gather per-batch top-k slots: [B, k, H, D]
-        # k_all_i: [N, B, H, D] -> [B, N, H, D], then gather along dim=1 with [B, k, H, D] index
-        k_all_i_b = k_all_i.permute(1, 0, 2, 3)      # [B, N, H, D]
-        v_all_i_b = v_all_i.permute(1, 0, 2, 3)      # [B, N, H, D]
-        g_all_i_b = g_all_i.permute(1, 0, 2, 3)      # [B, N, H, D]
-        beta_all_i_b = beta_all_i.permute(1, 0, 2)   # [B, N, H]
+        k_all_i_b    = k_all_i.permute(1, 0, 2, 3)    # [B, N, H, D]
+        v_all_i_b    = v_all_i.permute(1, 0, 2, 3)
+        g_all_i_b    = g_all_i.permute(1, 0, 2, 3)
+        beta_all_i_b = beta_all_i.permute(1, 0, 2)    # [B, N, H]
 
-        idx_kd = topk_idx_i[:, :, None, None].expand(-1, -1, H, K)  # [B, k, H, D]
-        idx_kv = topk_idx_i[:, :, None, None].expand(-1, -1, H, V)  # [B, k, H, V]
-        idx_kh = topk_idx_i[:, :, None].expand(-1, -1, H)           # [B, k, H]
+        w_idx_d = write_idx_i[:, :, None, None].expand(-1, -1, H, K)  # [B, 1, H, D]
+        w_idx_v = write_idx_i[:, :, None, None].expand(-1, -1, H, V)  # [B, 1, H, V]
+        w_idx_h = write_idx_i[:, :, None].expand(-1, -1, H)           # [B, 1, H]
 
-        k_topk    = k_all_i_b.gather(1, idx_kd)      # [B, k, H, D]
-        v_topk    = v_all_i_b.gather(1, idx_kv)      # [B, k, H, V]
-        g_topk    = g_all_i_b.gather(1, idx_kd)      # [B, k, H, D]
-        beta_topk = beta_all_i_b.gather(1, idx_kh)   # [B, k, H]
+        k_write    = k_all_i_b.gather(1, w_idx_d)     # [B, 1, H, D]
+        v_write    = v_all_i_b.gather(1, w_idx_v)     # [B, 1, H, V]
+        g_write    = g_all_i_b.gather(1, w_idx_d)     # [B, 1, H, D]
+        beta_write = beta_all_i_b.gather(1, w_idx_h)  # [B, 1, H]
 
-        # Decay: only top-k slots decay — unselected slots are frozen
-        S_topk = S_topk * g_topk[:, :, :, :, None].exp()   # [B, k, H, D, 1] broadcast
+        # Decay write slot
+        S_write = S_write * g_write[:, :, :, :, None].exp()  # [B, 1, H, D, 1] broadcast
 
-        # Write: delta rule update for top-k slots only, using per-slot k/v/beta
-        # (write before read, matching regular KDA order: decay -> write -> read)
-        r_i_topk = r_i.gather(1, topk_idx_i)                                   # [B, k]
-        kS      = torch.einsum('b s h d, b s h d v -> b s h v', k_topk, S_topk)   # [B, k, H, V]
-        residual = v_topk - kS                                                      # [B, k, H, V]
+        # Delta rule write (no routing weight — write is always full strength)
+        kS_w     = torch.einsum('b s h d, b s h d v -> b s h v', k_write, S_write)  # [B, 1, H, V]
+        residual = v_write - kS_w                                                     # [B, 1, H, V]
         if residual_log is not None:
             residual_log.clear()
             residual_log.append(residual.detach().abs().mean().item())
-        delta    = torch.einsum('b s h, b s h v, b s h d -> b s h d v', beta_topk, residual, k_topk)
-        weighted_delta = r_i_topk[:, :, None, None, None] * delta
-        S_topk = S_topk + weighted_delta
+        delta = torch.einsum('b s h, b s h v, b s h d -> b s h d v', beta_write, residual, k_write)
+        S_write = S_write + delta
 
-        # Read: query against top-k slots, weighted sum
-        # Note: 's' = top-k slot index, 'd' = key dim
-        retrieved = torch.einsum('b h d, b s h d v -> b s h v', q_i, S_topk)  # [B, k, H, V]
+        # Scatter written slot back
+        S = S.scatter(1, w_idx, S_write)
+
+        # ---- READ: query top-k slots (oracle/learned), weighted sum ----
+        r_idx = read_idx_i[:, :, None, None, None].expand(-1, -1, H, K, V)  # [B, k, H, K, V]
+        S_read = S.gather(1, r_idx)   # [B, k, H, K, V]
+
+        r_i_topk = r_i.gather(1, read_idx_i)                                            # [B, k]
+        retrieved = torch.einsum('b h d, b s h d v -> b s h v', q_i, S_read)            # [B, k, H, V]
         o_chunk[:, i] = torch.einsum('b s, b s h v -> b h v', r_i_topk, retrieved)
-
-        # Scatter updated top-k slots back (non-inplace to avoid grad checkpoint issues)
-        S = S.scatter(1, idx, S_topk)
 
     return o_chunk.to(dtype), S.to(dtype)
 
@@ -851,6 +848,7 @@ def naive_recurrent_sparse_kda_checkpointed(
     beta: torch.Tensor,
     router_weights: torch.Tensor,
     topk_indices: torch.Tensor,
+    write_indices: torch.Tensor,
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
@@ -861,13 +859,10 @@ def naive_recurrent_sparse_kda_checkpointed(
     """
     Chunked sparse KDA with gradient checkpointing for memory efficiency.
 
-    Processes the sequence in chunks of `chunk_size` tokens, applying
-    gradient checkpointing at each chunk boundary to reduce peak memory.
-    Only the top-k selected slots per token are read/written (MoE-style).
-
-    Args:
-        write_scale: multiplier on write weights to compensate for reduced
-                     per-slot update frequency when top_k < N. Typically N/top_k.
+    Write routing (LSH hash) and read routing (oracle/learned) are decoupled:
+      - write_indices: [B, T, 1]   — LSH-assigned slot per token (hard, no grad)
+      - topk_indices:  [B, T, k]   — read slots from oracle or learned router
+      - router_weights: [B, T, N]  — sparse read weights, used to blend read outputs
     """
     dtype = v.dtype
     B, T, H, K = q.shape
@@ -877,16 +872,13 @@ def naive_recurrent_sparse_kda_checkpointed(
     if scale is None:
         scale = K ** -0.5
 
-    # Scale queries
     q = q * scale
 
-    # Initialize state
     if initial_state is not None:
         S = initial_state.float()
     else:
         S = q.new_zeros(B, N, H, K, V_dim)
 
-    # Process in chunks
     num_chunks = (T + chunk_size - 1) // chunk_size
     o_parts = []
 
@@ -894,24 +886,23 @@ def naive_recurrent_sparse_kda_checkpointed(
         t_start = c * chunk_size
         t_end = min(t_start + chunk_size, T)
 
-        q_c    = q[:, t_start:t_end]
-        k_c    = k[:, :, t_start:t_end]       # [N, B, chunk, H, D]
-        v_c    = v[:, :, t_start:t_end]
-        g_c    = g[:, :, t_start:t_end]
-        b_c    = beta[:, :, t_start:t_end]    # [N, B, chunk, H]
-        r_c    = router_weights[:, t_start:t_end]
-        topk_c = topk_indices[:, t_start:t_end]   # [B, chunk_size, k]
+        q_c      = q[:, t_start:t_end]
+        k_c      = k[:, :, t_start:t_end]
+        v_c      = v[:, :, t_start:t_end]
+        g_c      = g[:, :, t_start:t_end]
+        b_c      = beta[:, :, t_start:t_end]
+        r_c      = router_weights[:, t_start:t_end]
+        topk_c   = topk_indices[:, t_start:t_end]    # [B, chunk, k]
+        write_c  = write_indices[:, t_start:t_end]   # [B, chunk, 1]
 
-        # grad_checkpoint passes all args through and saves/restores them
-        # It only recomputes the forward during backward, not storing inner activations
         if torch.is_grad_enabled():
             o_c, S = grad_checkpoint(
                 _sparse_kda_chunk,
-                q_c, k_c, v_c, g_c, b_c, r_c, S, topk_c, write_scale, residual_log,
+                q_c, k_c, v_c, g_c, b_c, r_c, S, topk_c, write_c, write_scale, residual_log,
                 use_reentrant=False,
             )
         else:
-            o_c, S = _sparse_kda_chunk(q_c, k_c, v_c, g_c, b_c, r_c, S, topk_c, write_scale, residual_log)
+            o_c, S = _sparse_kda_chunk(q_c, k_c, v_c, g_c, b_c, r_c, S, topk_c, write_c, write_scale, residual_log)
 
         o_parts.append(o_c)
 
@@ -959,6 +950,7 @@ class SparseKDAMemory(Module):
         router_loss_type='recon',
         router_use_normalized_q: bool = True,
         use_oracle_router: bool = False,
+        use_lsh_write: bool = True,
     ):
         super().__init__()
         dim_head = default(dim_head, dim // heads)
@@ -975,6 +967,7 @@ class SparseKDAMemory(Module):
         assert router_loss_type in ('recon', 'bal'), f"router_loss_type must be 'recon' or 'bal', got {router_loss_type!r}"
         self.router_loss_type = router_loss_type
         self.use_oracle_router = use_oracle_router
+        self.use_lsh_write = use_lsh_write
 
         head_k_dim = dim_head
         head_v_dim = dim_head
@@ -1028,6 +1021,17 @@ class SparseKDAMemory(Module):
         self.o_norm = nn.RMSNorm(head_v_dim, eps=norm_eps)
         self.o_proj = Linear(value_dim, dim, bias=False)
 
+        # LSH write routing: fixed random projection [D, N] (one vector per slot).
+        # Only allocated when use_lsh_write=True; otherwise write follows read routing.
+        if use_lsh_write:
+            self.register_buffer(
+                'lsh_proj',
+                F.normalize(torch.randn(dim_head, num_memory_slots), dim=0),
+                persistent=True,
+            )
+        else:
+            self.lsh_proj = None
+
         self.register_buffer('_slot_hit_counts', torch.zeros(num_memory_slots), persistent=False)
         self.register_buffer('_slot_weight_sum', torch.zeros(num_memory_slots), persistent=False)
         self.register_buffer('_slot_logit_sum', torch.zeros(num_memory_slots), persistent=False)
@@ -1053,6 +1057,23 @@ class SparseKDAMemory(Module):
         self._distill_loss_accum = None
         self._distill_loss_count = 0
         self.oracle_distill_temperature = 1.0  # softmax temperature for soft labels
+
+    @torch.no_grad()
+    def _route_lsh_write(self, q):
+        """
+        LSH-based write routing: assign each token to one slot via argmax of
+        random projections of the (mean-over-heads) query key vector.
+
+        Args:
+            q: [B, T, H, D]  — per-head normalized query
+        Returns:
+            write_indices: [B, T, 1]  — slot index per token (long, no grad)
+        """
+        # Average over heads to get a single D-dim representation per token
+        k_mean = q.mean(dim=2)                              # [B, T, D]
+        proj = k_mean.float() @ self.lsh_proj.float()      # [B, T, N]
+        write_idx = proj.argmax(dim=-1, keepdim=True)      # [B, T, 1]
+        return write_idx
 
     def _route(self, x):
         """
@@ -1379,22 +1400,18 @@ class SparseKDAMemory(Module):
             g    = torch.stack([o[2] for o in slot_outputs], dim=0)
             beta = torch.stack([o[3] for o in slot_outputs], dim=0)   # [N, B, T, H]
 
-            # Sparse routing weights [B, T, N] and top-k indices [B, T, k]
+            # Read routing: oracle or learned router → top-k indices + weights
             if self.use_oracle_router:
-                # Oracle routing: select slots by lowest dist(mem_readout, causal_attn_oracle)
                 router_weights, topk_indices = self._route_oracle(q, k, v, hidden_state)
             else:
-                # Learned router
                 q_flat_norm = rearrange(q, 'b t h d -> b t (h d)')
                 router_input = q_flat_norm if self.router_use_normalized_q else q_flat
                 router_weights, topk_indices = self._route(router_input)
 
             if debug_oracle:
                 slot_dist = self._run_oracle_debug(q, k, v, topk_indices, hidden_state)
-                # slot_dist: [N, B, T], no_grad — use as soft labels for router
-                # soft_label[b,t,i] ∝ exp(-dist[i,b,t] / T), lower dist → higher label
-                # router_logits: [B, T, N], has grad
-                # recompute router logits using the same router input
+                q_flat_norm = rearrange(q, 'b t h d -> b t (h d)')
+                router_input = q_flat_norm if self.router_use_normalized_q else q_flat
                 router_logits = self.router_fc(self.router_enc(router_input))  # [B, T, N], recompute with grad
                 slot_dist_bt = slot_dist.permute(1, 2, 0)          # [B, T, N]
                 soft_labels = (-slot_dist_bt / self.oracle_distill_temperature).softmax(dim=-1).detach()
@@ -1409,10 +1426,17 @@ class SparseKDAMemory(Module):
                     self._distill_loss_accum = self._distill_loss_accum + distill_loss
                 self._distill_loss_count += 1
 
+            # Write routing: LSH hash or fall back to read routing (top-1 of read slots)
+            if self.use_lsh_write:
+                write_indices = self._route_lsh_write(q)           # [B, T, 1]
+            else:
+                write_indices = topk_indices[:, :, :1]             # [B, T, 1] — top-1 read slot
+
             o, new_hidden_state = naive_recurrent_sparse_kda_checkpointed(
                 q=q, k=k, v=v, g=g, beta=beta,
                 router_weights=router_weights,
                 topk_indices=topk_indices,
+                write_indices=write_indices,
                 initial_state=hidden_state,
                 output_final_state=return_state,
                 chunk_size=32,
@@ -1477,6 +1501,7 @@ def create_sparse_kda_memory_for_mac(
     use_shared_memory=False,
     router_use_normalized_q: bool = True,
     use_oracle_router: bool = False,
+    use_lsh_write: bool = True,
     **kwargs
 ):
     """
@@ -1500,5 +1525,6 @@ def create_sparse_kda_memory_for_mac(
         use_shared_memory=use_shared_memory,
         router_use_normalized_q=router_use_normalized_q,
         use_oracle_router=use_oracle_router,
+        use_lsh_write=use_lsh_write,
         **kwargs
     )
